@@ -1,0 +1,79 @@
+name: Telegram Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Execution mode: shell (CMD) or code (PowerShell)'
+        required: true
+        default: 'code'
+        type: choice
+        options:
+          - code
+          - shell
+      content:
+        description: 'Script content or CMD command to run'
+        required: true
+        type: string
+      chat_id:
+        description: 'Telegram chat ID to send results back to'
+        required: true
+        type: string
+
+jobs:
+  run:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Run PowerShell Code
+        if: ${{ inputs.mode == 'code' }}
+        id: run_code
+        shell: powershell
+        env:
+          SCRIPT_CONTENT: ${{ inputs.content }}
+        run: |
+          $env:SCRIPT_CONTENT | Out-File -FilePath script.ps1 -Encoding UTF8
+          $output = & powershell -ExecutionPolicy Bypass -File script.ps1 2>&1 | Out-String
+          $maxLen = 3800
+          $truncated = if ($output.Length -gt $maxLen) { $output.Substring(0, $maxLen) + "`n...[truncated]" } else { $output }
+          Set-Content -Path output.txt -Value $truncated -Encoding UTF8
+
+      - name: Run CMD Shell Command
+        if: ${{ inputs.mode == 'shell' }}
+        id: run_shell
+        shell: powershell
+        env:
+          SCRIPT_CONTENT: ${{ inputs.content }}
+        run: |
+          $env:SCRIPT_CONTENT | Out-File -FilePath script.bat -Encoding ASCII
+          $output = cmd /c script.bat 2>&1 | Out-String
+          $maxLen = 3800
+          $truncated = if ($output.Length -gt $maxLen) { $output.Substring(0, $maxLen) + "`n...[truncated]" } else { $output }
+          Set-Content -Path output.txt -Value $truncated -Encoding UTF8
+
+      - name: Send result to Telegram
+        if: always()
+        shell: powershell
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ inputs.chat_id }}
+          JOB_STATUS: ${{ job.status }}
+          RUN_MODE: ${{ inputs.mode }}
+        run: |
+          $output = if (Test-Path output.txt) { (Get-Content output.txt -Raw -Encoding UTF8).Trim() } else { "(no output)" }
+          $status_icon = if ($env:JOB_STATUS -eq 'success') { "✅" } else { "❌" }
+          $mode_label = if ($env:RUN_MODE -eq 'shell') { "CMD" } else { "PowerShell" }
+          $text = "$status_icon [$mode_label] $($env:JOB_STATUS.ToUpper())`n`n<pre>$output</pre>"
+          $body = @{
+            chat_id    = $env:CHAT_ID
+            text       = $text
+            parse_mode = "HTML"
+          } | ConvertTo-Json -Depth 3
+          $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+          Invoke-WebRequest `
+            -Uri "https://api.telegram.org/bot$($env:TELEGRAM_BOT_TOKEN)/sendMessage" `
+            -Method POST `
+            -ContentType "application/json; charset=utf-8" `
+            -Body $bodyBytes `
+            -UseBasicParsing | Out-Null
