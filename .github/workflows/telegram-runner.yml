@@ -3,20 +3,12 @@ name: Telegram Runner
 on:
   workflow_dispatch:
     inputs:
-      mode:
-        description: 'Execution mode: shell (CMD) or code (PowerShell)'
-        required: true
-        default: 'code'
-        type: choice
-        options:
-          - code
-          - shell
-      content:
-        description: 'Script content or CMD command to run'
+      chat_id:
+        description: 'Telegram chat ID to monitor and reply to'
         required: true
         type: string
-      chat_id:
-        description: 'Telegram chat ID to send results back to'
+      webhook_url:
+        description: 'Replit webhook URL to restore when session ends'
         required: true
         type: string
 
@@ -26,54 +18,118 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Run PowerShell Code
-        if: ${{ inputs.mode == 'code' }}
-        id: run_code
-        shell: powershell
-        env:
-          SCRIPT_CONTENT: ${{ inputs.content }}
-        run: |
-          $env:SCRIPT_CONTENT | Out-File -FilePath script.ps1 -Encoding UTF8
-          $output = & powershell -ExecutionPolicy Bypass -File script.ps1 2>&1 | Out-String
-          $maxLen = 3800
-          $truncated = if ($output.Length -gt $maxLen) { $output.Substring(0, $maxLen) + "`n...[truncated]" } else { $output }
-          Set-Content -Path output.txt -Value $truncated -Encoding UTF8
-
-      - name: Run CMD Shell Command
-        if: ${{ inputs.mode == 'shell' }}
-        id: run_shell
-        shell: powershell
-        env:
-          SCRIPT_CONTENT: ${{ inputs.content }}
-        run: |
-          $env:SCRIPT_CONTENT | Out-File -FilePath script.bat -Encoding ASCII
-          $output = cmd /c script.bat 2>&1 | Out-String
-          $maxLen = 3800
-          $truncated = if ($output.Length -gt $maxLen) { $output.Substring(0, $maxLen) + "`n...[truncated]" } else { $output }
-          Set-Content -Path output.txt -Value $truncated -Encoding UTF8
-
-      - name: Send result to Telegram
-        if: always()
+      - name: Interactive Telegram session
         shell: powershell
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ inputs.chat_id }}
-          JOB_STATUS: ${{ job.status }}
-          RUN_MODE: ${{ inputs.mode }}
+          WEBHOOK_URL: ${{ inputs.webhook_url }}
         run: |
-          $output = if (Test-Path output.txt) { (Get-Content output.txt -Raw -Encoding UTF8).Trim() } else { "(no output)" }
-          $status_icon = if ($env:JOB_STATUS -eq 'success') { "✅" } else { "❌" }
-          $mode_label = if ($env:RUN_MODE -eq 'shell') { "CMD" } else { "PowerShell" }
-          $text = "$status_icon [$mode_label] $($env:JOB_STATUS.ToUpper())`n`n<pre>$output</pre>"
-          $body = @{
-            chat_id    = $env:CHAT_ID
-            text       = $text
-            parse_mode = "HTML"
-          } | ConvertTo-Json -Depth 3
-          $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($body)
-          Invoke-WebRequest `
-            -Uri "https://api.telegram.org/bot$($env:TELEGRAM_BOT_TOKEN)/sendMessage" `
-            -Method POST `
-            -ContentType "application/json; charset=utf-8" `
-            -Body $bodyBytes `
-            -UseBasicParsing | Out-Null
+          $token      = $env:TELEGRAM_BOT_TOKEN
+          $chatId     = $env:CHAT_ID
+          $webhookUrl = $env:WEBHOOK_URL
+          $apiBase    = "https://api.telegram.org/bot$token"
+
+          # ── helpers ──────────────────────────────────────────────────────────
+          function Send-Msg($text) {
+            $body  = @{ chat_id = $chatId; text = $text; parse_mode = "HTML" } | ConvertTo-Json -Depth 3
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+            try {
+              Invoke-WebRequest -Uri "$apiBase/sendMessage" -Method POST `
+                -ContentType "application/json; charset=utf-8" `
+                -Body $bytes -UseBasicParsing | Out-Null
+            } catch {}
+          }
+
+          function Html-Escape($s) {
+            return $s -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;'
+          }
+
+          function Restore-Webhook {
+            $body  = @{ url = $webhookUrl } | ConvertTo-Json
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+            try {
+              Invoke-WebRequest -Uri "$apiBase/setWebhook" -Method POST `
+                -ContentType "application/json; charset=utf-8" `
+                -Body $bytes -UseBasicParsing | Out-Null
+              Write-Host "Webhook restored: $webhookUrl"
+            } catch { Write-Host "Failed to restore webhook: $_" }
+          }
+
+          # ── delete webhook so getUpdates works ────────────────────────────────
+          Invoke-WebRequest -Uri "$apiBase/deleteWebhook" -Method POST -UseBasicParsing | Out-Null
+          Start-Sleep -Seconds 2
+
+          # fast-forward offset past any queued messages
+          $resp    = Invoke-WebRequest -Uri "$apiBase/getUpdates?limit=100&offset=-1" -UseBasicParsing
+          $updates = ($resp.Content | ConvertFrom-Json).result
+          $offset  = if ($updates.Count -gt 0) { $updates[-1].update_id + 1 } else { 0 }
+
+          $runId = $env:GITHUB_RUN_ID
+          Send-Msg "✅ <b>Windows VM ready</b> (run #$runId)`n`nSend any text → runs as <b>PowerShell</b>`nPrefix with <code>/</code> → runs in <b>CMD</b>`nSend <code>/stop</code> → end session"
+
+          # ── main polling loop ─────────────────────────────────────────────────
+          while ($true) {
+            try {
+              $pollUrl = "$apiBase/getUpdates?offset=$offset&timeout=30&allowed_updates=%5B%22message%22%5D"
+              $resp    = Invoke-WebRequest -Uri $pollUrl -UseBasicParsing -TimeoutSec 45
+              $result  = ($resp.Content | ConvertFrom-Json)
+
+              foreach ($update in $result.result) {
+                $offset = $update.update_id + 1
+                $msg    = $update.message
+                if (-not $msg -or -not $msg.text) { continue }
+                if ([string]$msg.chat.id -ne $chatId) { continue }
+
+                $text = $msg.text.Trim()
+
+                # ── /stop ──
+                if ($text -eq '/stop') {
+                  Send-Msg "🛑 Session ended. Restoring webhook..."
+                  Restore-Webhook
+                  exit 0
+                }
+
+                # ── determine mode ──
+                $isShell = $text.StartsWith('/')
+                $content = if ($isShell) { ($text.Substring(1) -replace '@\w+', '').Trim() } else { $text }
+                $label   = if ($isShell) { 'CMD' } else { 'PowerShell' }
+
+                if ([string]::IsNullOrWhiteSpace($content)) {
+                  Send-Msg "Please provide a command after /"
+                  continue
+                }
+
+                Send-Msg "⏳ Running [$label]..."
+
+                # ── execute ──
+                try {
+                  if ($isShell) {
+                    Set-Content -Path .\run.bat -Value $content -Encoding ASCII
+                    $output = (cmd /c .\run.bat 2>&1) | Out-String
+                  } else {
+                    Set-Content -Path .\run.ps1 -Value $content -Encoding UTF8
+                    $output = (& powershell.exe -ExecutionPolicy Bypass -File .\run.ps1 2>&1) | Out-String
+                  }
+
+                  $trimmed   = $output.TrimEnd()
+                  $maxLen    = 3500
+                  $truncated = if ($trimmed.Length -gt $maxLen) { $trimmed.Substring(0, $maxLen) + "`n`n…[output truncated]" } else { $trimmed }
+                  $escaped   = Html-Escape $truncated
+                  if ([string]::IsNullOrWhiteSpace($escaped)) { $escaped = "(no output)" }
+
+                  Send-Msg "✅ [$label]`n<pre>$escaped</pre>"
+
+                } catch {
+                  $errText = Html-Escape $_.Exception.Message
+                  Send-Msg "❌ [$label] Error:`n<pre>$errText</pre>"
+                }
+              }
+
+            } catch {
+              # network hiccup — wait briefly then retry
+              Start-Sleep -Seconds 3
+            }
+          }
+
+          Restore-Webhook
