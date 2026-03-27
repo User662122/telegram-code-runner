@@ -7,10 +7,6 @@ on:
         description: 'Telegram chat ID to monitor and reply to'
         required: true
         type: string
-      webhook_url:
-        description: 'Replit webhook URL to restore when session ends'
-        required: true
-        type: string
 
 jobs:
   run:
@@ -23,14 +19,19 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ inputs.chat_id }}
-          WEBHOOK_URL: ${{ inputs.webhook_url }}
         run: |
-          $token      = $env:TELEGRAM_BOT_TOKEN
-          $chatId     = $env:CHAT_ID
-          $webhookUrl = $env:WEBHOOK_URL
-          $apiBase    = "https://api.telegram.org/bot$token"
+          $token  = $env:TELEGRAM_BOT_TOKEN
+          $chatId = $env:CHAT_ID
+          $apiBase = "https://api.telegram.org/bot$token"
 
-          # ── helpers ──────────────────────────────────────────────────────────
+          # Build emoji strings from Unicode code points to avoid encoding issues
+          $E_OK   = [char]0x2705                       # checkmark box
+          $E_WAIT = [char]0x23F3                       # hourglass
+          $E_ERR  = [char]0x274C                       # red X
+          $E_STOP = [char]::ConvertFromUtf32(0x1F6D1)  # stop sign
+          $E_ARR  = [char]0x2192                       # right arrow
+          $E_ELL  = [char]0x2026                       # ellipsis
+
           function Send-Msg($text) {
             $body  = @{ chat_id = $chatId; text = $text; parse_mode = "HTML" } | ConvertTo-Json -Depth 3
             $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
@@ -45,30 +46,22 @@ jobs:
             return $s -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;'
           }
 
-          function Restore-Webhook {
-            $body  = @{ url = $webhookUrl } | ConvertTo-Json
-            $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
-            try {
-              Invoke-WebRequest -Uri "$apiBase/setWebhook" -Method POST `
-                -ContentType "application/json; charset=utf-8" `
-                -Body $bytes -UseBasicParsing | Out-Null
-              Write-Host "Webhook restored: $webhookUrl"
-            } catch { Write-Host "Failed to restore webhook: $_" }
-          }
-
-          # ── delete webhook so getUpdates works ────────────────────────────────
+          # Delete webhook so getUpdates works
           Invoke-WebRequest -Uri "$apiBase/deleteWebhook" -Method POST -UseBasicParsing | Out-Null
           Start-Sleep -Seconds 2
 
-          # fast-forward offset past any queued messages
+          # Fast-forward offset to skip any already-queued messages
           $resp    = Invoke-WebRequest -Uri "$apiBase/getUpdates?limit=100&offset=-1" -UseBasicParsing
           $updates = ($resp.Content | ConvertFrom-Json).result
           $offset  = if ($updates.Count -gt 0) { $updates[-1].update_id + 1 } else { 0 }
 
           $runId = $env:GITHUB_RUN_ID
-          Send-Msg "✅ <b>Windows VM ready</b> (run #$runId)`n`nSend any text → runs as <b>PowerShell</b>`nPrefix with <code>/</code> → runs in <b>CMD</b>`nSend <code>/stop</code> → end session"
+          Send-Msg ("$E_OK <b>Windows VM ready</b> (run #$runId)`n`n" +
+                    "Send any text $E_ARR runs as <b>PowerShell</b>`n" +
+                    "Prefix with <code>/</code> $E_ARR runs in <b>CMD</b>`n" +
+                    "Send <code>/stop</code> $E_ARR end session")
 
-          # ── main polling loop ─────────────────────────────────────────────────
+          # Main polling loop
           while ($true) {
             try {
               $pollUrl = "$apiBase/getUpdates?offset=$offset&timeout=30&allowed_updates=%5B%22message%22%5D"
@@ -83,14 +76,11 @@ jobs:
 
                 $text = $msg.text.Trim()
 
-                # ── /stop ──
                 if ($text -eq '/stop') {
-                  Send-Msg "🛑 Session ended. Restoring webhook..."
-                  Restore-Webhook
+                  Send-Msg "$E_STOP Session ended."
                   exit 0
                 }
 
-                # ── determine mode ──
                 $isShell = $text.StartsWith('/')
                 $content = if ($isShell) { ($text.Substring(1) -replace '@\w+', '').Trim() } else { $text }
                 $label   = if ($isShell) { 'CMD' } else { 'PowerShell' }
@@ -100,9 +90,8 @@ jobs:
                   continue
                 }
 
-                Send-Msg "⏳ Running [$label]..."
+                Send-Msg "$E_WAIT Running [$label]$E_ELL"
 
-                # ── execute ──
                 try {
                   if ($isShell) {
                     Set-Content -Path .\run.bat -Value $content -Encoding ASCII
@@ -114,22 +103,19 @@ jobs:
 
                   $trimmed   = $output.TrimEnd()
                   $maxLen    = 3500
-                  $truncated = if ($trimmed.Length -gt $maxLen) { $trimmed.Substring(0, $maxLen) + "`n`n…[output truncated]" } else { $trimmed }
+                  $truncated = if ($trimmed.Length -gt $maxLen) { $trimmed.Substring(0, $maxLen) + "`n$E_ELL[output truncated]" } else { $trimmed }
                   $escaped   = Html-Escape $truncated
                   if ([string]::IsNullOrWhiteSpace($escaped)) { $escaped = "(no output)" }
 
-                  Send-Msg "✅ [$label]`n<pre>$escaped</pre>"
+                  Send-Msg "$E_OK [$label]`n<pre>$escaped</pre>"
 
                 } catch {
                   $errText = Html-Escape $_.Exception.Message
-                  Send-Msg "❌ [$label] Error:`n<pre>$errText</pre>"
+                  Send-Msg "$E_ERR [$label] Error:`n<pre>$errText</pre>"
                 }
               }
 
             } catch {
-              # network hiccup — wait briefly then retry
               Start-Sleep -Seconds 3
             }
           }
-
-          Restore-Webhook
