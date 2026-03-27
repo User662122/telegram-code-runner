@@ -1,0 +1,26 @@
+name: Telegram Code Runner VM
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Start bot runner
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: python .github/runner.py
