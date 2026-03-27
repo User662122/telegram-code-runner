@@ -32,10 +32,6 @@ jobs:
           $E_ARR  = [char]0x2192
           $E_ELL  = [char]0x2026
 
-          function Html-Escape($s) {
-            return $s -replace '&','&amp;' -replace '<','&lt;' -replace '>','&gt;'
-          }
-
           function Send-Msg($text) {
             $b  = @{ chat_id = $chatId; text = $text; parse_mode = "HTML" } | ConvertTo-Json -Depth 3
             $by = [System.Text.Encoding]::UTF8.GetBytes($b)
@@ -57,7 +53,15 @@ jobs:
             } catch {}
           }
 
-          function Build-LiveText($label, $lines, $final) {
+          function Detect-Lang($code) {
+            # Python: import, from X import, def, class, print(, #!/usr/bin/env python
+            if ($code -match '(?m)^\s*(import\s+\w|from\s+\w+\s+import|def\s+\w+\s*\(|class\s+\w+[\s:(]|#!\s*/usr/bin/env\s+python)') {
+              return 'python'
+            }
+            return 'powershell'
+          }
+
+          function Build-LiveText($lang, $lines, $final) {
             $E_OK   = [char]0x2705
             $E_WAIT = [char]0x23F3
             $E_ELL  = [char]0x2026
@@ -70,7 +74,7 @@ jobs:
             }
             $icon   = if ($final) { $E_OK } else { $E_WAIT }
             $suffix = if ($final) { "" }     else { " <i>(live)</i>" }
-            return "$icon [$label]$suffix`n<pre>$esc</pre>"
+            return "$icon [$lang]$suffix`n<pre>$esc</pre>"
           }
 
           # Remove webhook so getUpdates works
@@ -84,7 +88,8 @@ jobs:
 
           $runId = $env:GITHUB_RUN_ID
           Send-Msg ("$E_OK <b>Windows VM ready</b> (run #$runId)`n`n" +
-                    "Text $E_ARR PowerShell     |     <code>/cmd</code> $E_ARR CMD`n" +
+                    "Text $E_ARR auto-detected (Python / PowerShell)`n" +
+                    "<code>/cmd</code> prefix $E_ARR CMD shell`n" +
                     "<code>/stop</code> $E_ARR end session") | Out-Null
 
           while ($true) {
@@ -106,44 +111,72 @@ jobs:
                   exit 0
                 }
 
-                $isShell = $text.StartsWith('/')
-                $content = if ($isShell) { ($text.Substring(1) -replace '@\w+','').Trim() } else { $text }
-                $label   = if ($isShell) { 'CMD' } else { 'PowerShell' }
+                # Determine mode
+                if ($text.StartsWith('/')) {
+                  $lang    = 'CMD'
+                  $content = ($text.Substring(1) -replace '@\w+','').Trim()
+                } else {
+                  $content = $text
+                  $lang    = Detect-Lang $content   # 'python' or 'powershell'
+                }
 
                 if ([string]::IsNullOrWhiteSpace($content)) {
                   Send-Msg "Please provide a command after /" | Out-Null
                   continue
                 }
 
-                $liveMsgId   = Send-Msg "$E_WAIT [$label] starting$E_ELL"
+                $liveMsgId   = Send-Msg "$E_WAIT [$lang] starting$E_ELL"
                 $outputLines = [System.Collections.Generic.List[string]]::new()
                 $lastEdit    = [DateTime]::MinValue
 
                 try {
-                  if ($isShell) {
-                    Set-Content -Path .\run.bat -Value $content -Encoding ASCII
-                    cmd /c .\run.bat 2>&1 | ForEach-Object {
-                      $outputLines.Add([string]$_)
-                      if (([DateTime]::Now - $lastEdit).TotalSeconds -ge 1.0) {
-                        $lastEdit = [DateTime]::Now
-                        Edit-Msg $liveMsgId (Build-LiveText $label $outputLines $false)
+                  $scriptBlock = {
+                    param($line)
+                    $outputLines.Add([string]$line)
+                    if (([DateTime]::Now - $lastEdit).TotalSeconds -ge 1.0) {
+                      $lastEdit = [DateTime]::Now
+                      Edit-Msg $liveMsgId (Build-LiveText $lang $outputLines $false)
+                    }
+                  }
+
+                  switch ($lang) {
+                    'CMD' {
+                      Set-Content -Path .\run.bat -Value $content -Encoding ASCII
+                      cmd /c .\run.bat 2>&1 | ForEach-Object {
+                        $outputLines.Add([string]$_)
+                        if (([DateTime]::Now - $lastEdit).TotalSeconds -ge 1.0) {
+                          $lastEdit = [DateTime]::Now
+                          Edit-Msg $liveMsgId (Build-LiveText $lang $outputLines $false)
+                        }
                       }
                     }
-                  } else {
-                    Set-Content -Path .\run.ps1 -Value $content -Encoding UTF8
-                    powershell.exe -ExecutionPolicy Bypass -File .\run.ps1 2>&1 | ForEach-Object {
-                      $outputLines.Add([string]$_)
-                      if (([DateTime]::Now - $lastEdit).TotalSeconds -ge 1.0) {
-                        $lastEdit = [DateTime]::Now
-                        Edit-Msg $liveMsgId (Build-LiveText $label $outputLines $false)
+                    'python' {
+                      Set-Content -Path .\run.py -Value $content -Encoding UTF8
+                      python .\run.py 2>&1 | ForEach-Object {
+                        $outputLines.Add([string]$_)
+                        if (([DateTime]::Now - $lastEdit).TotalSeconds -ge 1.0) {
+                          $lastEdit = [DateTime]::Now
+                          Edit-Msg $liveMsgId (Build-LiveText $lang $outputLines $false)
+                        }
+                      }
+                    }
+                    default {
+                      Set-Content -Path .\run.ps1 -Value $content -Encoding UTF8
+                      powershell.exe -ExecutionPolicy Bypass -File .\run.ps1 2>&1 | ForEach-Object {
+                        $outputLines.Add([string]$_)
+                        if (([DateTime]::Now - $lastEdit).TotalSeconds -ge 1.0) {
+                          $lastEdit = [DateTime]::Now
+                          Edit-Msg $liveMsgId (Build-LiveText $lang $outputLines $false)
+                        }
                       }
                     }
                   }
-                  Edit-Msg $liveMsgId (Build-LiveText $label $outputLines $true)
+
+                  Edit-Msg $liveMsgId (Build-LiveText $lang $outputLines $true)
 
                 } catch {
                   $errEsc = ($_.Exception.Message) -replace '&','&amp;' -replace '<','&lt;' -replace '>','&gt;'
-                  Edit-Msg $liveMsgId "$E_ERR [$label] Error:`n<pre>$errEsc</pre>"
+                  Edit-Msg $liveMsgId "$E_ERR [$lang] Error:`n<pre>$errEsc</pre>"
                 }
               }
             } catch {
