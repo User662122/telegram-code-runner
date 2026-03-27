@@ -23,10 +23,8 @@ jobs:
         run: |
           $token   = $env:TELEGRAM_BOT_TOKEN
           $chatId  = $env:CHAT_ID
-          $apiBase = "https://api.github.com" -replace 'github','telegram.org/bot' + $token
           $apiBase = "https://api.telegram.org/bot$token"
 
-          # Build non-ASCII chars from code points to avoid encoding issues
           $E_OK   = [char]0x2705
           $E_WAIT = [char]0x23F3
           $E_ERR  = [char]0x274C
@@ -70,8 +68,8 @@ jobs:
             if ([string]::IsNullOrWhiteSpace($esc)) {
               $esc = if ($final) { "(no output)" } else { "(running$E_ELL)" }
             }
-            $icon   = if ($final) { $E_OK }   else { $E_WAIT }
-            $suffix = if ($final) { "" }       else { " <i>(live)</i>" }
+            $icon   = if ($final) { $E_OK } else { $E_WAIT }
+            $suffix = if ($final) { "" }     else { " <i>(live)</i>" }
             return "$icon [$label]$suffix`n<pre>$esc</pre>"
           }
 
@@ -89,7 +87,6 @@ jobs:
                     "Text $E_ARR PowerShell     |     <code>/cmd</code> $E_ARR CMD`n" +
                     "<code>/stop</code> $E_ARR end session") | Out-Null
 
-          # Main polling loop
           while ($true) {
             try {
               $pollUrl = "$apiBase/getUpdates?offset=$offset&timeout=30&allowed_updates=%5B%22message%22%5D"
@@ -118,7 +115,6 @@ jobs:
                   continue
                 }
 
-                # Post the initial live message and get its ID for editing
                 $liveMsgId   = Send-Msg "$E_WAIT [$label] starting$E_ELL"
                 $outputLines = [System.Collections.Generic.List[string]]::new()
                 $lastEdit    = [DateTime]::MinValue
@@ -143,7 +139,6 @@ jobs:
                       }
                     }
                   }
-                  # Final edit once command finishes
                   Edit-Msg $liveMsgId (Build-LiveText $label $outputLines $true)
 
                 } catch {
