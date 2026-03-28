@@ -54,7 +54,6 @@ jobs:
           }
 
           function Detect-Lang($code) {
-            # Python: import, from X import, def, class, print(, #!/usr/bin/env python
             if ($code -match '(?m)^\s*(import\s+\w|from\s+\w+\s+import|def\s+\w+\s*\(|class\s+\w+[\s:(]|#!\s*/usr/bin/env\s+python)') {
               return 'python'
             }
@@ -75,6 +74,14 @@ jobs:
             $icon   = if ($final) { $E_OK } else { $E_WAIT }
             $suffix = if ($final) { "" }     else { " <i>(live)</i>" }
             return "$icon [$lang]$suffix`n<pre>$esc</pre>"
+          }
+
+          # FIX: Helper to safely stringify pipeline objects (handles ErrorRecord from stderr)
+          function Stringify-Output($item) {
+            if ($item -is [System.Management.Automation.ErrorRecord]) {
+              return $item.Exception.Message
+            }
+            return [string]$item
           }
 
           # Remove webhook so getUpdates works
@@ -130,49 +137,59 @@ jobs:
                 $lastEdit    = [DateTime]::MinValue
 
                 try {
-                  $scriptBlock = {
-                    param($line)
-                    $outputLines.Add([string]$line)
-                    if (([DateTime]::Now - $lastEdit).TotalSeconds -ge 1.0) {
-                      $lastEdit = [DateTime]::Now
-                      Edit-Msg $liveMsgId (Build-LiveText $lang $outputLines $false)
-                    }
-                  }
-
                   switch ($lang) {
                     'CMD' {
                       Set-Content -Path .\run.bat -Value $content -Encoding ASCII
-                      cmd /c .\run.bat 2>&1 | ForEach-Object {
-                        $outputLines.Add([string]$_)
-                        if (([DateTime]::Now - $lastEdit).TotalSeconds -ge 1.0) {
-                          $lastEdit = [DateTime]::Now
-                          Edit-Msg $liveMsgId (Build-LiveText $lang $outputLines $false)
+                      # FIX: Wrapped in try/finally to guarantee final Edit-Msg fires.
+                      #      Cast each item via Stringify-Output to capture stderr ErrorRecords.
+                      try {
+                        cmd /c .\run.bat 2>&1 | ForEach-Object {
+                          $line = Stringify-Output $_
+                          $outputLines.Add($line)
+                          if (([DateTime]::Now - $lastEdit).TotalSeconds -ge 1.0) {
+                            $lastEdit = [DateTime]::Now
+                            Edit-Msg $liveMsgId (Build-LiveText $lang $outputLines $false)
+                          }
                         }
+                      } finally {
+                        Edit-Msg $liveMsgId (Build-LiveText $lang $outputLines $true)
                       }
                     }
                     'python' {
                       Set-Content -Path .\run.py -Value $content -Encoding UTF8
-                      python .\run.py 2>&1 | ForEach-Object {
-                        $outputLines.Add([string]$_)
-                        if (([DateTime]::Now - $lastEdit).TotalSeconds -ge 1.0) {
-                          $lastEdit = [DateTime]::Now
-                          Edit-Msg $liveMsgId (Build-LiveText $lang $outputLines $false)
+                      # FIX: Wrapped in try/finally to guarantee final Edit-Msg fires.
+                      #      Cast each item via Stringify-Output to capture full tracebacks.
+                      try {
+                        python .\run.py 2>&1 | ForEach-Object {
+                          $line = Stringify-Output $_
+                          $outputLines.Add($line)
+                          if (([DateTime]::Now - $lastEdit).TotalSeconds -ge 1.0) {
+                            $lastEdit = [DateTime]::Now
+                            Edit-Msg $liveMsgId (Build-LiveText $lang $outputLines $false)
+                          }
                         }
+                      } finally {
+                        Edit-Msg $liveMsgId (Build-LiveText $lang $outputLines $true)
                       }
                     }
                     default {
                       Set-Content -Path .\run.ps1 -Value $content -Encoding UTF8
-                      powershell.exe -ExecutionPolicy Bypass -File .\run.ps1 2>&1 | ForEach-Object {
-                        $outputLines.Add([string]$_)
-                        if (([DateTime]::Now - $lastEdit).TotalSeconds -ge 1.0) {
-                          $lastEdit = [DateTime]::Now
-                          Edit-Msg $liveMsgId (Build-LiveText $lang $outputLines $false)
+                      # FIX: Wrapped in try/finally to guarantee final Edit-Msg fires.
+                      #      Cast each item via Stringify-Output to capture stderr ErrorRecords.
+                      try {
+                        powershell.exe -ExecutionPolicy Bypass -File .\run.ps1 2>&1 | ForEach-Object {
+                          $line = Stringify-Output $_
+                          $outputLines.Add($line)
+                          if (([DateTime]::Now - $lastEdit).TotalSeconds -ge 1.0) {
+                            $lastEdit = [DateTime]::Now
+                            Edit-Msg $liveMsgId (Build-LiveText $lang $outputLines $false)
+                          }
                         }
+                      } finally {
+                        Edit-Msg $liveMsgId (Build-LiveText $lang $outputLines $true)
                       }
                     }
                   }
-
-                  Edit-Msg $liveMsgId (Build-LiveText $lang $outputLines $true)
 
                 } catch {
                   $errEsc = ($_.Exception.Message) -replace '&','&amp;' -replace '<','&lt;' -replace '>','&gt;'
