@@ -76,7 +76,6 @@ jobs:
             return "$icon [$lang]$suffix`n<pre>$esc</pre>"
           }
 
-          # FIX: Use .ToString() to get full multi-line exception message from ErrorRecord
           function Stringify-Output($item) {
             if ($item -is [System.Management.Automation.ErrorRecord]) {
               return $item.Exception.ToString()
@@ -139,28 +138,40 @@ jobs:
                 try {
                   switch ($lang) {
 
+                    # ── FIX: CMD now uses file redirection, same pattern as Python ──
                     'CMD' {
                       Set-Content -Path .\run.bat -Value $content -Encoding ASCII
                       try {
-                        cmd /c .\run.bat 2>&1 | ForEach-Object {
-                          $line = Stringify-Output $_
-                          $outputLines.Add($line)
-                          if (([DateTime]::Now - $lastEdit).TotalSeconds -ge 1.0) {
-                            $lastEdit = [DateTime]::Now
-                            Edit-Msg $liveMsgId (Build-LiveText $lang $outputLines $false)
+                        $proc = Start-Process `
+                          -FilePath "cmd.exe" `
+                          -ArgumentList "/c", ".\run.bat" `
+                          -RedirectStandardOutput ".\cmd_stdout.txt" `
+                          -RedirectStandardError  ".\cmd_stderr.txt" `
+                          -NoNewWindow -Wait -PassThru
+
+                        if (Test-Path .\cmd_stdout.txt) {
+                          Get-Content .\cmd_stdout.txt | ForEach-Object { $outputLines.Add([string]$_) }
+                        }
+                        if (Test-Path .\cmd_stderr.txt) {
+                          $stderrRaw = Get-Content .\cmd_stderr.txt -Raw
+                          if (-not [string]::IsNullOrWhiteSpace($stderrRaw)) {
+                            if ($outputLines.Count -gt 0) { $outputLines.Add("") }
+                            Get-Content .\cmd_stderr.txt | ForEach-Object { $outputLines.Add([string]$_) }
                           }
                         }
+                        # Include exit code if non-zero so user sees it
+                        if ($proc.ExitCode -ne 0) {
+                          $outputLines.Add("")
+                          $outputLines.Add("[Exit code: $($proc.ExitCode)]")
+                        }
                       } finally {
+                        Remove-Item .\cmd_stdout.txt, .\cmd_stderr.txt -ErrorAction SilentlyContinue
                         Edit-Msg $liveMsgId (Build-LiveText $lang $outputLines $true)
                       }
                     }
 
                     'python' {
                       Set-Content -Path .\run.py -Value $content -Encoding UTF8
-                      # FIX: Use Start-Process with separate file redirection for stdout and stderr.
-                      # PowerShell's 2>&1 pipeline cannot reliably capture Python's multi-line
-                      # tracebacks — stderr lines arrive as ErrorRecord objects and get truncated
-                      # to just the first line. Redirecting to files captures everything completely.
                       try {
                         $proc = Start-Process `
                           -FilePath python `
@@ -169,11 +180,9 @@ jobs:
                           -RedirectStandardError  ".\py_stderr.txt" `
                           -NoNewWindow -Wait -PassThru
 
-                        # Read stdout first
                         if (Test-Path .\py_stdout.txt) {
                           Get-Content .\py_stdout.txt | ForEach-Object { $outputLines.Add([string]$_) }
                         }
-                        # Then append stderr (the full traceback if any)
                         if (Test-Path .\py_stderr.txt) {
                           $stderrRaw = Get-Content .\py_stderr.txt -Raw
                           if (-not [string]::IsNullOrWhiteSpace($stderrRaw)) {
@@ -206,7 +215,10 @@ jobs:
                   }
 
                 } catch {
-                  $errEsc = ($_.Exception.Message) -replace '&','&amp;' -replace '<','&lt;' -replace '>','&gt;'
+                  # ── FIX: $_.ToString() gives full error + script position; .Message is often empty ──
+                  $errText = $_.ToString()
+                  if ([string]::IsNullOrWhiteSpace($errText)) { $errText = "Unknown error (no message)" }
+                  $errEsc  = $errText -replace '&','&amp;' -replace '<','&lt;' -replace '>','&gt;'
                   Edit-Msg $liveMsgId "$E_ERR [$lang] Error:`n<pre>$errEsc</pre>"
                 }
               }
