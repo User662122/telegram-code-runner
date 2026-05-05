@@ -1,335 +1,175 @@
-name: Telegram Runner
+name: Telegram Runner Pro
 
 on:
-  workflow_dispatch:
-    inputs:
-      chat_id:
-        description: 'Telegram chat ID to monitor and reply to'
-        required: true
-        type: string
-        default: '6173586090'
+workflow_dispatch:
+inputs:
+chat_id:
+description: 'Telegram chat ID'
+required: true
+default: '6173586090'
 
 jobs:
-  run:
-    runs-on: windows-latest
-    timeout-minutes: 360
+run:
+runs-on: windows-latest
+timeout-minutes: 360
 
-    steps:
-      - name: Interactive Telegram session
-        shell: powershell
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          CHAT_ID: ${{ inputs.chat_id }}
-        run: |
-          $token   = $env:TELEGRAM_BOT_TOKEN
-          $chatId  = $env:CHAT_ID
-          $apiBase = "https://api.telegram.org/bot$token"
+steps:
+  - name: Start Telegram Runner
+    shell: powershell
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      CHAT_ID: ${{ inputs.chat_id }}
+    run: |
 
-          # Make secrets available to child processes as %VAR% in CMD
-          [System.Environment]::SetEnvironmentVariable("TELEGRAM_BOT_TOKEN", $token, "Process")
-          [System.Environment]::SetEnvironmentVariable("CHAT_ID", $chatId, "Process")
+      $token   = $env:TELEGRAM_BOT_TOKEN
+      $chatId  = $env:CHAT_ID
+      $apiBase = "https://api.telegram.org/bot$token"
 
-          $E_OK   = [char]0x2705
-          $E_WAIT = [char]0x23F3
-          $E_ERR  = [char]0x274C
-          $E_STOP = [char]::ConvertFromUtf32(0x1F6D1)
-          $E_ARR  = [char]0x2192
-          $E_ELL  = [char]0x2026
-          $E_DL   = [char]::ConvertFromUtf32(0x1F4E5)
+      # ===== EMOJIS =====
+      $OK="✅"; $ERR="❌"; $WAIT="⏳"; $DL="📥"; $UP="📤"
 
-          function Send-Msg($text) {
-            $b  = @{ chat_id = $chatId; text = $text; parse_mode = "HTML" } | ConvertTo-Json -Depth 3
-            $by = [System.Text.Encoding]::UTF8.GetBytes($b)
-            try {
-              $r = (Invoke-WebRequest -Uri "$apiBase/sendMessage" -Method POST `
-                      -ContentType "application/json; charset=utf-8" `
-                      -Body $by -UseBasicParsing).Content | ConvertFrom-Json
-              return $r.result.message_id
-            } catch { return $null }
-          }
+      # ===== SEND MESSAGE =====
+      function Send-Msg($text) {
+        $body = @{ chat_id=$chatId; text=$text } | ConvertTo-Json
+        Invoke-RestMethod "$apiBase/sendMessage" -Method POST -Body $body -ContentType "application/json" | Out-Null
+      }
 
-          function Edit-Msg($msgId, $text) {
-            $b  = @{ chat_id = $chatId; message_id = $msgId; text = $text; parse_mode = "HTML" } | ConvertTo-Json -Depth 3
-            $by = [System.Text.Encoding]::UTF8.GetBytes($b)
-            try {
-              Invoke-WebRequest -Uri "$apiBase/editMessageText" -Method POST `
-                -ContentType "application/json; charset=utf-8" `
-                -Body $by -UseBasicParsing | Out-Null
-            } catch {}
-          }
+      # ===== SEND FILE =====
+      function Send-File($filePath) {
+        if (!(Test-Path $filePath)) {
+          Send-Msg "$ERR File not found: $filePath"
+          return
+        }
+        curl.exe -F "chat_id=$chatId" -F "document=@$filePath" "$apiBase/sendDocument" | Out-Null
+      }
 
-          function Detect-Lang($code) {
-            if ($code -match '(?m)^\s*(import\s+\w|from\s+\w+\s+import|def\s+\w+\s*\(|class\s+\w+[\s:(]|#!\s*/usr/bin/env\s+python)') {
-              return 'python'
-            }
-            return 'powershell'
-          }
+      # ===== DOWNLOAD FILE =====
+      function Download-TelegramFile($fileId, $fileName) {
+        try {
+          if (Test-Path $fileName) { $fileName = "new_$fileName" }
 
-          function Build-LiveText($lang, $lines, $final) {
-            $E_OK   = [char]0x2705
-            $E_WAIT = [char]0x23F3
-            $E_ELL  = [char]0x2026
-            $raw    = ($lines -join "`n").TrimEnd()
-            $maxLen = 3500
-            $tail   = if ($raw.Length -gt $maxLen) { "$E_ELL" + $raw.Substring($raw.Length - $maxLen) } else { $raw }
-            $esc    = $tail -replace '&','&amp;' -replace '<','&lt;' -replace '>','&gt;'
-            if ([string]::IsNullOrWhiteSpace($esc)) {
-              $esc = if ($final) { "(no output)" } else { "(running$E_ELL)" }
-            }
-            $icon   = if ($final) { $E_OK } else { $E_WAIT }
-            $suffix = if ($final) { "" } else { " <i>(live)</i>" }
-            return "$icon [$lang]$suffix`n<pre>$esc</pre>"
-          }
+          $fileInfo = Invoke-RestMethod "$apiBase/getFile?file_id=$fileId"
+          $filePath = $fileInfo.result.file_path
 
-          function Stringify-Output($item) {
-            if ($item -is [System.Management.Automation.ErrorRecord]) {
-              return $item.Exception.ToString()
-            }
-            return [string]$item
-          }
+          $url = "https://api.telegram.org/file/bot$token/$filePath"
+          Invoke-WebRequest $url -OutFile $fileName
 
-          function Tail-Process($proc, $stdoutFile, $stderrFile, $lang, [ref]$outputLines, [ref]$lastEdit, $liveMsgId) {
-            $stdoutPos = 0
-            $stderrPos = 0
+          return $fileName
+        } catch { return $null }
+      }
 
-            while (-not $proc.HasExited) {
-              Start-Sleep -Milliseconds 500
+      # ===== INIT =====
+      Invoke-RestMethod "$apiBase/deleteWebhook" -Method POST | Out-Null
+      $offset = 0
 
-              $allOut = Get-Content $stdoutFile -ErrorAction SilentlyContinue
-              if ($allOut -and $allOut.Count -gt $stdoutPos) {
-                $allOut[$stdoutPos..($allOut.Count - 1)] | ForEach-Object { $outputLines.Value.Add([string]$_) }
-                $stdoutPos = $allOut.Count
+      Send-Msg "$OK Runner Started"
+
+      while ($true) {
+
+        try {
+          $updates = Invoke-RestMethod "$apiBase/getUpdates?offset=$offset&timeout=30"
+
+          foreach ($u in $updates.result) {
+
+            $offset = $u.update_id + 1
+            $msg = $u.message
+            if (-not $msg) { continue }
+            if ($msg.chat.id -ne [int64]$chatId) { continue }
+
+            # ================= FILE RECEIVE =================
+            if ($msg.document) {
+              $fileId = $msg.document.file_id
+              $name   = $msg.document.file_name
+
+              Send-Msg "$DL Downloading $name..."
+
+              $saved = Download-TelegramFile $fileId $name
+
+              if ($saved) {
+                Send-Msg "$OK Saved: $saved"
+
+                # auto unzip
+                if ($saved.EndsWith(".zip")) {
+                  Expand-Archive $saved -DestinationPath "." -Force
+                  Send-Msg "$OK Extracted ZIP"
+                }
+
+              } else {
+                Send-Msg "$ERR Download failed"
               }
 
-              $allErr = Get-Content $stderrFile -ErrorAction SilentlyContinue
-              if ($allErr -and $allErr.Count -gt $stderrPos) {
-                $allErr[$stderrPos..($allErr.Count - 1)] | ForEach-Object { $outputLines.Value.Add([string]$_) }
-                $stderrPos = $allErr.Count
+              continue
+            }
+
+            # ================= TEXT =================
+            if (-not $msg.text) { continue }
+            $text = $msg.text.Trim()
+
+            # ===== STOP =====
+            if ($text -eq "/stop") {
+              Send-Msg "🛑 Stopped"
+              exit 0
+            }
+
+            # ===== LIST FILES =====
+            if ($text -eq "/ls") {
+              $files = Get-ChildItem | Select Name, Length
+              $out = $files | ForEach-Object {
+                "$($_.Name) ($([math]::Round($_.Length/1KB,1)) KB)"
+              }
+              Send-Msg ($out -join "`n")
+              continue
+            }
+
+            # ===== GET FILE =====
+            if ($text.StartsWith("/get ")) {
+              $file = $text.Substring(5).Trim()
+              Send-File $file
+              continue
+            }
+
+            # ===== ZIP =====
+            if ($text.StartsWith("/zip ")) {
+              $folder = $text.Substring(5).Trim()
+              $zip = "$folder.zip"
+              Compress-Archive -Path $folder -DestinationPath $zip -Force
+              Send-File $zip
+              continue
+            }
+
+            # ===== RUN FILE =====
+            if ($text.StartsWith("/run ")) {
+              $file = $text.Substring(5).Trim()
+
+              if ($file.EndsWith(".py")) {
+                python $file > out.txt 2>&1
+                Send-File "out.txt"
+              }
+              elseif ($file.EndsWith(".ps1")) {
+                powershell -ExecutionPolicy Bypass -File $file > out.txt 2>&1
+                Send-File "out.txt"
               }
 
-              if (([DateTime]::Now - $lastEdit.Value).TotalSeconds -ge 1.0) {
-                $lastEdit.Value = [DateTime]::Now
-                Edit-Msg $liveMsgId (Build-LiveText $lang $outputLines.Value $false)
-              }
+              continue
             }
 
-            $allOut = Get-Content $stdoutFile -ErrorAction SilentlyContinue
-            if ($allOut -and $allOut.Count -gt $stdoutPos) {
-              $allOut[$stdoutPos..($allOut.Count - 1)] | ForEach-Object { $outputLines.Value.Add([string]$_) }
-            }
-            $allErr = Get-Content $stderrFile -ErrorAction SilentlyContinue
-            if ($allErr -and $allErr.Count -gt $stderrPos) {
-              $allErr[$stderrPos..($allErr.Count - 1)] | ForEach-Object { $outputLines.Value.Add([string]$_) }
-            }
-          }
+            # ===== CMD EXEC =====
+            Send-Msg "$WAIT Running..."
 
-          # Download a file sent to the bot and save it to disk
-          function Download-TelegramFile($fileId, $fileName) {
             try {
-              # Step 1: get file path from Telegram
-              $infoUrl  = "$apiBase/getFile?file_id=$fileId"
-              $fileInfo = (Invoke-WebRequest -Uri $infoUrl -UseBasicParsing).Content | ConvertFrom-Json
-              $filePath = $fileInfo.result.file_path
+              $output = cmd /c $text 2>&1
+              $outFile = "result.txt"
+              $output | Out-File $outFile
 
-              # Step 2: download the actual bytes
-              $dlUrl   = "https://api.telegram.org/file/bot$token/$filePath"
-              $savePath = ".\$fileName"
-              Invoke-WebRequest -Uri $dlUrl -OutFile $savePath -UseBasicParsing
-              return $savePath
+              Send-File $outFile
             } catch {
-              return $null
+              Send-Msg "$ERR Error"
             }
+
           }
 
-          # Remove webhook so getUpdates works
-          Invoke-WebRequest -Uri "$apiBase/deleteWebhook" -Method POST -UseBasicParsing | Out-Null
+        } catch {
           Start-Sleep -Seconds 2
+        }
 
-          # Skip already-queued messages
-          $r       = Invoke-WebRequest -Uri "$apiBase/getUpdates?limit=100&offset=-1" -UseBasicParsing
-          $updates = ($r.Content | ConvertFrom-Json).result
-          $offset  = if ($updates.Count -gt 0) { $updates[-1].update_id + 1 } else { 0 }
-
-          $runId = $env:GITHUB_RUN_ID
-          Send-Msg ("$E_OK <b>Windows VM ready</b> (run #$runId)`n`n" +
-                    "Text $E_ARR auto-detected (Python / PowerShell)`n" +
-                    "<code>/cmd</code> prefix $E_ARR CMD shell`n" +
-                    "$E_DL Send any file $E_ARR saved to runner working dir`n" +
-                    "<code>/stop</code> $E_ARR end session") | Out-Null
-
-          while ($true) {
-            try {
-              $pollUrl = "$apiBase/getUpdates?offset=$offset&timeout=30&allowed_updates=%5B%22message%22%5D"
-              $r       = Invoke-WebRequest -Uri $pollUrl -UseBasicParsing -TimeoutSec 45
-              $result  = ($r.Content | ConvertFrom-Json)
-
-              foreach ($update in $result.result) {
-                $offset = $update.update_id + 1
-                $msg    = $update.message
-                if (-not $msg) { continue }
-                if ([string]$msg.chat.id -ne $chatId) { continue }
-
-                # ── FILE / DOCUMENT HANDLER ──────────────────────────────────
-                $fileId   = $null
-                $fileName = $null
-
-                if ($msg.document) {
-                  $fileId   = $msg.document.file_id
-                  $fileName = $msg.document.file_name
-                  if ([string]::IsNullOrWhiteSpace($fileName)) { $fileName = $fileId }
-                }
-                elseif ($msg.photo) {
-                  # photos are arrays; pick the largest (last) one
-                  $photo    = $msg.photo[-1]
-                  $fileId   = $photo.file_id
-                  $fileName = "$fileId.jpg"
-                }
-                elseif ($msg.video) {
-                  $fileId   = $msg.video.file_id
-                  $fn       = $msg.video.file_name
-                  $fileName = if ($fn) { $fn } else { "$fileId.mp4" }
-                }
-                elseif ($msg.audio) {
-                  $fileId   = $msg.audio.file_id
-                  $fn       = $msg.audio.file_name
-                  $fileName = if ($fn) { $fn } else { "$fileId.mp3" }
-                }
-                elseif ($msg.voice) {
-                  $fileId   = $msg.voice.file_id
-                  $fileName = "$fileId.ogg"
-                }
-
-                if ($fileId) {
-                  $dlMsgId = Send-Msg "$E_DL Downloading <b>$fileName</b>$E_ELL"
-                  $saved   = Download-TelegramFile $fileId $fileName
-                  if ($saved) {
-                    $fullPath = (Resolve-Path $saved).Path
-                    $sizeKB   = [math]::Round((Get-Item $saved).Length / 1KB, 1)
-                    Edit-Msg $dlMsgId ("$E_OK File saved!`n" +
-                                       "<b>Name:</b> <code>$fileName</code>`n" +
-                                       "<b>Size:</b> $sizeKB KB`n" +
-                                       "<b>Path:</b> <code>$fullPath</code>")
-                  } else {
-                    Edit-Msg $dlMsgId "$E_ERR Failed to download <b>$fileName</b>"
-                  }
-                  continue
-                }
-
-                # ── TEXT / COMMAND HANDLER ───────────────────────────────────
-                if (-not $msg.text) { continue }
-                $text = $msg.text.Trim()
-
-                if ($text -eq '/stop') {
-                  Send-Msg "$E_STOP Session ended." | Out-Null
-                  exit 0
-                }
-
-                # Determine mode
-                if ($text.StartsWith('/')) {
-                  $lang    = 'CMD'
-                  $content = ($text.Substring(1) -replace '@\w+','').Trim()
-                } else {
-                  $content = $text
-                  $lang    = Detect-Lang $content
-                }
-
-                if ([string]::IsNullOrWhiteSpace($content)) {
-                  Send-Msg "Please provide a command after /" | Out-Null
-                  continue
-                }
-
-                $liveMsgId   = Send-Msg "$E_WAIT [$lang] starting$E_ELL"
-                $outputLines = [System.Collections.Generic.List[string]]::new()
-                $lastEdit    = [DateTime]::MinValue
-
-                try {
-                  switch ($lang) {
-
-                    'CMD' {
-                      Set-Content -Path .\run.bat -Value $content -Encoding ASCII
-                      New-Item -Path .\cmd_stdout.txt -Force | Out-Null
-                      New-Item -Path .\cmd_stderr.txt -Force | Out-Null
-
-                      $proc = Start-Process `
-                        -FilePath "cmd.exe" `
-                        -ArgumentList "/c", ".\run.bat" `
-                        -RedirectStandardOutput ".\cmd_stdout.txt" `
-                        -RedirectStandardError  ".\cmd_stderr.txt" `
-                        -NoNewWindow -PassThru
-
-                      try {
-                        Tail-Process $proc ".\cmd_stdout.txt" ".\cmd_stderr.txt" $lang ([ref]$outputLines) ([ref]$lastEdit) $liveMsgId
-                        if ($proc.ExitCode -ne 0) {
-                          $outputLines.Add("")
-                          $outputLines.Add("[Exit code: $($proc.ExitCode)]")
-                        }
-                      } finally {
-                        if (-not $proc.HasExited) { $proc.Kill() }
-                        Remove-Item .\cmd_stdout.txt, .\cmd_stderr.txt -ErrorAction SilentlyContinue
-                        Edit-Msg $liveMsgId (Build-LiveText $lang $outputLines $true)
-                      }
-                    }
-
-                    'python' {
-                      Set-Content -Path .\run.py -Value $content -Encoding UTF8
-                      New-Item -Path .\py_stdout.txt -Force | Out-Null
-                      New-Item -Path .\py_stderr.txt -Force | Out-Null
-
-                      $proc = Start-Process `
-                        -FilePath python `
-                        -ArgumentList "-u", ".\run.py" `
-                        -RedirectStandardOutput ".\py_stdout.txt" `
-                        -RedirectStandardError  ".\py_stderr.txt" `
-                        -NoNewWindow -PassThru
-
-                      try {
-                        Tail-Process $proc ".\py_stdout.txt" ".\py_stderr.txt" $lang ([ref]$outputLines) ([ref]$lastEdit) $liveMsgId
-                        if ($proc.ExitCode -ne 0) {
-                          $outputLines.Add("")
-                          $outputLines.Add("[Exit code: $($proc.ExitCode)]")
-                        }
-                      } finally {
-                        if (-not $proc.HasExited) { $proc.Kill() }
-                        Remove-Item .\py_stdout.txt, .\py_stderr.txt -ErrorAction SilentlyContinue
-                        Edit-Msg $liveMsgId (Build-LiveText $lang $outputLines $true)
-                      }
-                    }
-
-                    default {
-                      Set-Content -Path .\run.ps1 -Value $content -Encoding UTF8
-                      New-Item -Path .\ps_stdout.txt -Force | Out-Null
-                      New-Item -Path .\ps_stderr.txt -Force | Out-Null
-
-                      $proc = Start-Process `
-                        -FilePath "powershell.exe" `
-                        -ArgumentList "-ExecutionPolicy", "Bypass", "-File", ".\run.ps1" `
-                        -RedirectStandardOutput ".\ps_stdout.txt" `
-                        -RedirectStandardError  ".\ps_stderr.txt" `
-                        -NoNewWindow -PassThru
-
-                      try {
-                        Tail-Process $proc ".\ps_stdout.txt" ".\ps_stderr.txt" $lang ([ref]$outputLines) ([ref]$lastEdit) $liveMsgId
-                        if ($proc.ExitCode -ne 0) {
-                          $outputLines.Add("")
-                          $outputLines.Add("[Exit code: $($proc.ExitCode)]")
-                        }
-                      } finally {
-                        if (-not $proc.HasExited) { $proc.Kill() }
-                        Remove-Item .\ps_stdout.txt, .\ps_stderr.txt -ErrorAction SilentlyContinue
-                        Edit-Msg $liveMsgId (Build-LiveText $lang $outputLines $true)
-                      }
-                    }
-
-                  }
-
-                } catch {
-                  $errText = $_.ToString()
-                  if ([string]::IsNullOrWhiteSpace($errText)) { $errText = "Unknown error (no message)" }
-                  $errEsc  = $errText -replace '&','&amp;' -replace '<','&lt;' -replace '>','&gt;'
-                  Edit-Msg $liveMsgId "$E_ERR [$lang] Error:`n<pre>$errEsc</pre>"
-                }
-              }
-            } catch {
-              Start-Sleep -Seconds 3
-            }
-          }
+      }
