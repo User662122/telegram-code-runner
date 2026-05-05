@@ -25,12 +25,17 @@ jobs:
           $chatId  = $env:CHAT_ID
           $apiBase = "https://api.telegram.org/bot$token"
 
+          # Make secrets available to child processes as %VAR% in CMD
+          [System.Environment]::SetEnvironmentVariable("TELEGRAM_BOT_TOKEN", $token, "Process")
+          [System.Environment]::SetEnvironmentVariable("CHAT_ID", $chatId, "Process")
+
           $E_OK   = [char]0x2705
           $E_WAIT = [char]0x23F3
           $E_ERR  = [char]0x274C
           $E_STOP = [char]::ConvertFromUtf32(0x1F6D1)
           $E_ARR  = [char]0x2192
           $E_ELL  = [char]0x2026
+          $E_DL   = [char]::ConvertFromUtf32(0x1F4E5)
 
           function Send-Msg($text) {
             $b  = @{ chat_id = $chatId; text = $text; parse_mode = "HTML" } | ConvertTo-Json -Depth 3
@@ -108,7 +113,6 @@ jobs:
               }
             }
 
-            # Drain remaining output after exit
             $allOut = Get-Content $stdoutFile -ErrorAction SilentlyContinue
             if ($allOut -and $allOut.Count -gt $stdoutPos) {
               $allOut[$stdoutPos..($allOut.Count - 1)] | ForEach-Object { $outputLines.Value.Add([string]$_) }
@@ -116,6 +120,24 @@ jobs:
             $allErr = Get-Content $stderrFile -ErrorAction SilentlyContinue
             if ($allErr -and $allErr.Count -gt $stderrPos) {
               $allErr[$stderrPos..($allErr.Count - 1)] | ForEach-Object { $outputLines.Value.Add([string]$_) }
+            }
+          }
+
+          # Download a file sent to the bot and save it to disk
+          function Download-TelegramFile($fileId, $fileName) {
+            try {
+              # Step 1: get file path from Telegram
+              $infoUrl  = "$apiBase/getFile?file_id=$fileId"
+              $fileInfo = (Invoke-WebRequest -Uri $infoUrl -UseBasicParsing).Content | ConvertFrom-Json
+              $filePath = $fileInfo.result.file_path
+
+              # Step 2: download the actual bytes
+              $dlUrl   = "https://api.telegram.org/file/bot$token/$filePath"
+              $savePath = ".\$fileName"
+              Invoke-WebRequest -Uri $dlUrl -OutFile $savePath -UseBasicParsing
+              return $savePath
+            } catch {
+              return $null
             }
           }
 
@@ -132,6 +154,7 @@ jobs:
           Send-Msg ("$E_OK <b>Windows VM ready</b> (run #$runId)`n`n" +
                     "Text $E_ARR auto-detected (Python / PowerShell)`n" +
                     "<code>/cmd</code> prefix $E_ARR CMD shell`n" +
+                    "$E_DL Send any file $E_ARR saved to runner working dir`n" +
                     "<code>/stop</code> $E_ARR end session") | Out-Null
 
           while ($true) {
@@ -143,9 +166,57 @@ jobs:
               foreach ($update in $result.result) {
                 $offset = $update.update_id + 1
                 $msg    = $update.message
-                if (-not $msg -or -not $msg.text) { continue }
+                if (-not $msg) { continue }
                 if ([string]$msg.chat.id -ne $chatId) { continue }
 
+                # ── FILE / DOCUMENT HANDLER ──────────────────────────────────
+                $fileId   = $null
+                $fileName = $null
+
+                if ($msg.document) {
+                  $fileId   = $msg.document.file_id
+                  $fileName = $msg.document.file_name
+                  if ([string]::IsNullOrWhiteSpace($fileName)) { $fileName = $fileId }
+                }
+                elseif ($msg.photo) {
+                  # photos are arrays; pick the largest (last) one
+                  $photo    = $msg.photo[-1]
+                  $fileId   = $photo.file_id
+                  $fileName = "$fileId.jpg"
+                }
+                elseif ($msg.video) {
+                  $fileId   = $msg.video.file_id
+                  $fn       = $msg.video.file_name
+                  $fileName = if ($fn) { $fn } else { "$fileId.mp4" }
+                }
+                elseif ($msg.audio) {
+                  $fileId   = $msg.audio.file_id
+                  $fn       = $msg.audio.file_name
+                  $fileName = if ($fn) { $fn } else { "$fileId.mp3" }
+                }
+                elseif ($msg.voice) {
+                  $fileId   = $msg.voice.file_id
+                  $fileName = "$fileId.ogg"
+                }
+
+                if ($fileId) {
+                  $dlMsgId = Send-Msg "$E_DL Downloading <b>$fileName</b>$E_ELL"
+                  $saved   = Download-TelegramFile $fileId $fileName
+                  if ($saved) {
+                    $fullPath = (Resolve-Path $saved).Path
+                    $sizeKB   = [math]::Round((Get-Item $saved).Length / 1KB, 1)
+                    Edit-Msg $dlMsgId ("$E_OK File saved!`n" +
+                                       "<b>Name:</b> <code>$fileName</code>`n" +
+                                       "<b>Size:</b> $sizeKB KB`n" +
+                                       "<b>Path:</b> <code>$fullPath</code>")
+                  } else {
+                    Edit-Msg $dlMsgId "$E_ERR Failed to download <b>$fileName</b>"
+                  }
+                  continue
+                }
+
+                # ── TEXT / COMMAND HANDLER ───────────────────────────────────
+                if (-not $msg.text) { continue }
                 $text = $msg.text.Trim()
 
                 if ($text -eq '/stop') {
@@ -176,8 +247,6 @@ jobs:
 
                     'CMD' {
                       Set-Content -Path .\run.bat -Value $content -Encoding ASCII
-
-                      # Pre-create files so tailing never fails
                       New-Item -Path .\cmd_stdout.txt -Force | Out-Null
                       New-Item -Path .\cmd_stderr.txt -Force | Out-Null
 
@@ -190,7 +259,6 @@ jobs:
 
                       try {
                         Tail-Process $proc ".\cmd_stdout.txt" ".\cmd_stderr.txt" $lang ([ref]$outputLines) ([ref]$lastEdit) $liveMsgId
-
                         if ($proc.ExitCode -ne 0) {
                           $outputLines.Add("")
                           $outputLines.Add("[Exit code: $($proc.ExitCode)]")
@@ -204,7 +272,6 @@ jobs:
 
                     'python' {
                       Set-Content -Path .\run.py -Value $content -Encoding UTF8
-
                       New-Item -Path .\py_stdout.txt -Force | Out-Null
                       New-Item -Path .\py_stderr.txt -Force | Out-Null
 
@@ -217,7 +284,6 @@ jobs:
 
                       try {
                         Tail-Process $proc ".\py_stdout.txt" ".\py_stderr.txt" $lang ([ref]$outputLines) ([ref]$lastEdit) $liveMsgId
-
                         if ($proc.ExitCode -ne 0) {
                           $outputLines.Add("")
                           $outputLines.Add("[Exit code: $($proc.ExitCode)]")
@@ -231,7 +297,6 @@ jobs:
 
                     default {
                       Set-Content -Path .\run.ps1 -Value $content -Encoding UTF8
-
                       New-Item -Path .\ps_stdout.txt -Force | Out-Null
                       New-Item -Path .\ps_stderr.txt -Force | Out-Null
 
@@ -244,7 +309,6 @@ jobs:
 
                       try {
                         Tail-Process $proc ".\ps_stdout.txt" ".\ps_stderr.txt" $lang ([ref]$outputLines) ([ref]$lastEdit) $liveMsgId
-
                         if ($proc.ExitCode -ne 0) {
                           $outputLines.Add("")
                           $outputLines.Add("[Exit code: $($proc.ExitCode)]")
