@@ -123,7 +123,18 @@ if not TOKEN:
 
 print("GitHub VM Bot started.", flush=True)
 
-offset = 0
+# Initialize offset to skip past updates
+try:
+    r = requests.get(f"{BASE}/getUpdates", params={"offset": -1}, timeout=10)
+    updates = r.json().get("result", [])
+    if updates:
+        offset = updates[0]["update_id"] + 1
+    else:
+        offset = 0
+except Exception as e:
+    print(f"Error initializing offset: {e}")
+    offset = 0
+
 while True:
     try:
         r = requests.get(
