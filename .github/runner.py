@@ -5,6 +5,8 @@ import time
 import sys
 import os
 import glob
+import threading
+import signal
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 # Optional: restrict to a specific chat ID for security
@@ -14,6 +16,9 @@ if ALLOWED_CHAT_ID:
 
 BASE  = f"https://api.telegram.org/bot{TOKEN}"
 TICK  = chr(96) * 3
+
+# Global variable to track the current running process
+current_process = None
 
 def send_message(chat_id, text, parse_mode='Markdown'):
     try:
@@ -47,11 +52,18 @@ def send_document(chat_id, file_path):
         print(f"[send_document error] {e}", flush=True)
         send_message(chat_id, f"Error sending document: {e}")
 
+def send_photo(chat_id, file_path):
+    try:
+        if not os.path.exists(file_path):
+            return
+        with open(file_path, 'rb') as f:
+            requests.post(f"{BASE}/sendPhoto", data={"chat_id": chat_id}, files={"photo": f}, timeout=30)
+    except Exception as e:
+        print(f"[send_photo error] {e}", flush=True)
+
 def download_file(chat_id, file_id, file_name):
     try:
-        # Sanitize filename to prevent path traversal
         file_name = os.path.basename(file_name)
-
         r = requests.get(f"{BASE}/getFile", params={"file_id": file_id})
         file_info = r.json()
         if not file_info.get("ok"):
@@ -70,51 +82,68 @@ def download_file(chat_id, file_id, file_name):
         print(f"[download error] {e}", flush=True)
         send_message(chat_id, f"Error downloading file: {e}")
 
-def run_python(code):
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".py",
-                                     delete=False, encoding="utf-8") as f:
-        f.write(code)
-        fname = f.name
-    try:
-        r = subprocess.run(
-            [sys.executable, fname],
-            capture_output=True, text=True, timeout=60,
-            cwd=os.getcwd()
-        )
-        return (r.stdout + r.stderr).strip() or "(No output)"
-    except subprocess.TimeoutExpired:
-        return "Error: Timed out (60s limit)"
-    except Exception as e:
-        return f"Error: {e}"
-    finally:
-        try:
-            os.unlink(fname)
-        except:
-            pass
+def run_command(chat_id, cmd, is_python=False):
+    global current_process
 
-def run_shell(command):
+    def target():
+        global current_process
+        try:
+            if is_python:
+                with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as f:
+                    f.write(cmd)
+                    fname = f.name
+                process_cmd = [sys.executable, fname]
+            else:
+                process_cmd = cmd
+                fname = None
+
+            current_process = subprocess.Popen(
+                process_cmd, shell=not is_python,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, cwd=os.getcwd()
+            )
+
+            output, _ = current_process.communicate()
+            current_process = None
+
+            if fname:
+                try: os.unlink(fname)
+                except: pass
+
+            out = output.strip() or "(No output)"
+            if len(out) > 3800:
+                with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+                    f.write(out)
+                    temp_name = f.name
+                send_document(chat_id, temp_name)
+                os.unlink(temp_name)
+            else:
+                send_message(chat_id, f"{TICK}\n{out}\n{TICK}")
+
+        except Exception as e:
+            current_process = None
+            send_message(chat_id, f"Error: {e}")
+
+    thread = threading.Thread(target=target)
+    thread.start()
+
+def take_screenshot(chat_id):
     try:
-        r = subprocess.run(
-            command, shell=True, capture_output=True, text=True, timeout=60,
-            cwd=os.getcwd()
-        )
-        return (r.stdout + r.stderr).strip() or "(No output)"
-    except subprocess.TimeoutExpired:
-        return "Error: Timed out (60s limit)"
+        import mss
+        with mss.mss() as sct:
+            filename = sct.shot(output="screenshot.png")
+            send_photo(chat_id, filename)
+            os.remove(filename)
     except Exception as e:
-        return f"Error: {e}"
+        send_message(chat_id, f"Screenshot error: {e}")
 
 WELCOME = (
     "*GitHub VM Bot*\n\n"
-    "Send me:\n"
     "- *Python code* -> send directly\n"
-    "- *Shell command* -> start with `/` or `pip` or `npm` etc.\n"
-    "- *Files/Images/Videos* -> I will save them to the current directory\n\n"
-    "*Commands:*\n"
-    "- `/ls` : List files\n"
-    "- `/get <filename>` : Download a file\n"
-    "- `/cd <dir>` : Change directory\n"
-    "- `/stop` : Stop the runner"
+    "- *Shell command* -> start with `/` or `pip`/`npm`/`git`/`python`\n"
+    "- *Files* -> I will save them\n"
+    "- `screen` -> take screenshot\n"
+    "- `terminate` -> kill current task"
 )
 
 if not TOKEN:
@@ -123,66 +152,34 @@ if not TOKEN:
 
 print("GitHub VM Bot started.", flush=True)
 
-# Initialize offset to skip past updates
 try:
     r = requests.get(f"{BASE}/getUpdates", params={"offset": -1}, timeout=10)
     updates = r.json().get("result", [])
-    if updates:
-        offset = updates[0]["update_id"] + 1
-    else:
-        offset = 0
-except Exception as e:
-    print(f"Error initializing offset: {e}")
+    offset = updates[0]["update_id"] + 1 if updates else 0
+except:
     offset = 0
 
 while True:
     try:
-        r = requests.get(
-            f"{BASE}/getUpdates",
-            params={"offset": offset, "timeout": 30},
-            timeout=40
-        )
+        r = requests.get(f"{BASE}/getUpdates", params={"offset": offset, "timeout": 30}, timeout=40)
         updates = r.json().get("result", [])
 
         for upd in updates:
             offset = upd["update_id"] + 1
-            msg     = upd.get("message", {})
+            msg = upd.get("message", {})
             chat_id = msg.get("chat", {}).get("id")
-
-            if not chat_id:
+            if not chat_id or (ALLOWED_CHAT_ID and chat_id != ALLOWED_CHAT_ID):
                 continue
 
-            # Security: check if chat_id is allowed
-            if ALLOWED_CHAT_ID and chat_id != ALLOWED_CHAT_ID:
-                print(f"Unauthorized access attempt from chat_id: {chat_id}")
-                continue
-
+            # Handle Media
             file_id = None
             file_name = None
-
-            # Handle Documents
             if "document" in msg:
-                doc = msg["document"]
-                file_id = doc["file_id"]
-                file_name = doc.get("file_name", "uploaded_file")
-
-            # Handle Photos
+                file_id, file_name = msg["document"]["file_id"], msg["document"].get("file_name", "file")
             elif "photo" in msg:
-                photo = msg["photo"][-1]
-                file_id = photo["file_id"]
-                file_name = f"photo_{int(time.time())}.jpg"
-
-            # Handle Video
+                file_id, file_name = msg["photo"][-1]["file_id"], f"photo_{int(time.time())}.jpg"
             elif "video" in msg:
-                vid = msg["video"]
-                file_id = vid["file_id"]
-                file_name = vid.get("file_name", f"video_{int(time.time())}.mp4")
-
-            # Handle Audio
-            elif "audio" in msg:
-                aud = msg["audio"]
-                file_id = aud["file_id"]
-                file_name = aud.get("file_name", f"audio_{int(time.time())}.mp3")
+                file_id, file_name = msg["video"]["file_id"], msg["video"].get("file_name", "video.mp4")
 
             if file_id:
                 send_message(chat_id, f"Downloading `{file_name}`...")
@@ -190,89 +187,50 @@ while True:
                 continue
 
             text = (msg.get("text") or "").strip()
-            if not text:
-                continue
-
-            print(f"[chat {chat_id}] {text[:60]}", flush=True)
+            if not text: continue
 
             if text in ("/start", "/help"):
-                send_message(chat_id, WELCOME)
-                continue
+                send_message(chat_id, WELCOME); continue
 
             if text == "/stop":
-                send_message(chat_id, "Stopping runner...")
-                sys.exit(0)
+                send_message(chat_id, "Stopping..."); sys.exit(0)
+
+            if text.lower() == "screen":
+                take_screenshot(chat_id); continue
+
+            if text.lower() == "terminate":
+                if current_process:
+                    current_process.terminate()
+                    send_message(chat_id, "Task terminated.")
+                else:
+                    send_message(chat_id, "No task running.")
+                continue
 
             if text == "/ls" or text.startswith("/ls "):
-                args = text.split(maxsplit=1)
-                path = args[1] if len(args) > 1 else "."
+                path = text.split(maxsplit=1)[1] if " " in text else "."
                 try:
                     files = os.listdir(path)
-                    if not files:
-                        send_message(chat_id, f"Directory `{path}` is empty.")
-                    else:
-                        out = "\n".join(files)
-                        send_message(chat_id, f"{TICK}\n{out}\n{TICK}")
-                except Exception as e:
-                    send_message(chat_id, f"Error: {e}")
+                    send_message(chat_id, f"{TICK}\n" + ("\n".join(files) or "Empty") + f"\n{TICK}")
+                except Exception as e: send_message(chat_id, f"Error: {e}")
                 continue
 
             if text.startswith("/cd "):
-                new_dir = text[4:].strip()
                 try:
-                    os.chdir(new_dir)
-                    send_message(chat_id, f"Changed directory to `{os.getcwd()}`")
-                except Exception as e:
-                    send_message(chat_id, f"Error: {e}")
+                    os.chdir(text[4:].strip())
+                    send_message(chat_id, f"Dir: `{os.getcwd()}`")
+                except Exception as e: send_message(chat_id, f"Error: {e}")
                 continue
 
             if text.startswith("/get "):
-                file_pattern = text[5:].strip()
-                files = glob.glob(file_pattern)
-                if not files:
-                    send_message(chat_id, f"No files found matching `{file_pattern}`")
-                else:
-                    for f in files:
-                        if os.path.isfile(f):
-                            send_document(chat_id, f)
-                        else:
-                            send_message(chat_id, f"`{f}` is not a file.")
+                for f in glob.glob(text[5:].strip()):
+                    if os.path.isfile(f): send_document(chat_id, f)
                 continue
 
-            is_shell = text.startswith("/") or \
-                       text.startswith("pip ") or text == "pip" or \
-                       text.startswith("npm ") or text == "npm" or \
-                       text.startswith("git ") or text == "git" or \
-                       text.startswith("python ") or text == "python"
+            is_shell = text.startswith("/") or any(text.startswith(x) for x in ["pip ", "npm ", "git ", "python "])
+            cmd = text[1:].strip() if text.startswith("/") else text
 
-            if is_shell:
-                command = text[1:].strip() if text.startswith("/") else text
-                send_message(chat_id, f"Running shell command...")
-                out = run_shell(command)
-                if len(out) > 3800:
-                    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
-                        f.write(out)
-                        temp_name = f.name
-                    send_document(chat_id, temp_name)
-                    os.unlink(temp_name)
-                else:
-                    send_message(chat_id, f"{TICK}\n{out}\n{TICK}")
-            else:
-                send_message(chat_id, 'Running Python code...')
-                out = run_python(text)
-                if len(out) > 3800:
-                    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
-                        f.write(out)
-                        temp_name = f.name
-                    send_document(chat_id, temp_name)
-                    os.unlink(temp_name)
-                else:
-                    send_message(chat_id, f"{TICK}\n{out}\n{TICK}")
+            send_message(chat_id, "Running...")
+            run_command(chat_id, cmd, is_python=not is_shell)
 
-    except requests.exceptions.Timeout:
-        pass
-    except KeyboardInterrupt:
-        sys.exit(0)
     except Exception as e:
-        print(f"[loop error] {e}", flush=True)
-        time.sleep(5)
+        print(f"Error: {e}"); time.sleep(5)
