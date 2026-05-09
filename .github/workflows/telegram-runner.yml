@@ -1,12 +1,11 @@
-name: Telegram Runner Stable
+name: Telegram Runner
 
 on:
   workflow_dispatch:
     inputs:
       chat_id:
-        description: Telegram chat ID
-        required: true
-        default: "6173586090"
+        description: Authorized Telegram chat ID (Recommended for security)
+        required: false
 
 jobs:
   run:
@@ -14,177 +13,22 @@ jobs:
     timeout-minutes: 360
 
     steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: |
+          pip install requests
+
       - name: Start Runner
-        shell: powershell
+        shell: cmd
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          CHAT_ID: ${{ inputs.chat_id }}
+          ALLOWED_CHAT_ID: ${{ inputs.chat_id }}
         run: |
-
-          $token   = $env:TELEGRAM_BOT_TOKEN
-          $chatId  = $env:CHAT_ID
-          $apiBase = "https://api.telegram.org/bot$token"
-
-          # ===== SEND MESSAGE =====
-          function Send-Msg($text) {
-            try {
-              curl.exe -s -X POST "$apiBase/sendMessage" `
-                -d "chat_id=$chatId" `
-                --data-urlencode "text=$text" | Out-Null
-            } catch {}
-          }
-
-          # ===== SEND FILE =====
-          function Send-File($filePath) {
-            if (!(Test-Path $filePath)) {
-              Send-Msg "File not found: $filePath"
-              return
-            }
-            curl.exe -s -F "chat_id=$chatId" -F "document=@$filePath" "$apiBase/sendDocument" | Out-Null
-          }
-
-          # ===== DOWNLOAD FILE =====
-          function Download-TelegramFile($fileId, $fileName) {
-            try {
-              if (Test-Path $fileName) { $fileName = "new_$fileName" }
-
-              $fileInfo = Invoke-RestMethod "$apiBase/getFile?file_id=$fileId"
-              $filePath = $fileInfo.result.file_path
-              $url = "https://api.telegram.org/file/bot$token/$filePath"
-
-              Invoke-WebRequest $url -OutFile $fileName
-              return $fileName
-            } catch { return $null }
-          }
-
-          # ===== INIT =====
-          Invoke-RestMethod "$apiBase/deleteWebhook" -Method POST | Out-Null
-          $offset = 0
-
-          Send-Msg "Runner Started"
-
-          while ($true) {
-            try {
-              $updates = Invoke-RestMethod "$apiBase/getUpdates?offset=$offset&timeout=30"
-
-              foreach ($u in $updates.result) {
-
-                $offset = $u.update_id + 1
-                $msg = $u.message
-                if (-not $msg) { continue }
-                if ($msg.chat.id -ne [int64]$chatId) { continue }
-
-                # ===== FILE RECEIVE =====
-                if ($msg.document) {
-                  $fileId = $msg.document.file_id
-                  $name   = $msg.document.file_name
-
-                  Send-Msg "Downloading $name..."
-
-                  $saved = Download-TelegramFile $fileId $name
-
-                  if ($saved) {
-                    Send-Msg "Saved: $saved"
-
-                    if ($saved.EndsWith(".zip")) {
-                      Expand-Archive $saved -DestinationPath "." -Force
-                      Send-Msg "ZIP Extracted"
-                    }
-                  } else {
-                    Send-Msg "Download failed"
-                  }
-                  continue
-                }
-
-                if (-not $msg.text) { continue }
-                $text = $msg.text.Trim()
-
-                # ===== STOP =====
-                if ($text -eq "/stop") {
-                  Send-Msg "Stopped"
-                  exit 0
-                }
-
-                # ===== LIST FILES =====
-                if ($text -eq "/ls") {
-                  $files = Get-ChildItem
-
-                  if ($files.Count -eq 0) {
-                    Send-Msg "Folder empty"
-                  } else {
-                    $out = $files | Select-Object -First 30 | ForEach-Object {
-                      "$($_.Name)"
-                    }
-                    Send-Msg ($out -join "`n")
-                  }
-                  continue
-                }
-
-                # ===== GET FILE =====
-                if ($text.StartsWith("/get ")) {
-                  $file = $text.Substring(5).Trim()
-                  Send-File $file
-                  continue
-                }
-
-                # ===== ZIP =====
-                if ($text.StartsWith("/zip ")) {
-                  $folder = $text.Substring(5).Trim()
-                  $zip = "$folder.zip"
-
-                  if (Test-Path $folder) {
-                    Compress-Archive -Path $folder -DestinationPath $zip -Force
-                    Send-File $zip
-                  } else {
-                    Send-Msg "Folder not found"
-                  }
-                  continue
-                }
-
-                # ===== RUN FILE =====
-                if ($text.StartsWith("/run ")) {
-                  $file = $text.Substring(5).Trim()
-
-                  if (!(Test-Path $file)) {
-                    Send-Msg "File not found"
-                    continue
-                  }
-
-                  if ($file.EndsWith(".py")) {
-                    python $file > out.txt 2>&1
-                    Send-File "out.txt"
-                  }
-                  elseif ($file.EndsWith(".ps1")) {
-                    powershell -ExecutionPolicy Bypass -File $file > out.txt 2>&1
-                    Send-File "out.txt"
-                  } else {
-                    Send-Msg "Unsupported file"
-                  }
-                  continue
-                }
-
-                # ===== CMD EXEC =====
-                Send-Msg "Running..."
-
-                try {
-                  $output = cmd /c $text 2>&1
-                  $textOut = ($output | Out-String).Trim()
-
-                  if ($textOut.Length -lt 3000) {
-                    Send-Msg $textOut
-                  } else {
-                    $outFile = "result.txt"
-                    $textOut | Out-File $outFile
-                    Send-File $outFile
-                  }
-
-                } catch {
-                  Send-Msg "Error running command"
-                }
-
-              }
-
-            } catch {
-              Start-Sleep -Seconds 2
-            }
-          }
+          python .github/runner.py
