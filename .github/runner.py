@@ -128,15 +128,40 @@ def run_command(chat_id, cmd, is_python=False):
     thread.start()
 
 def take_screenshot(chat_id):
+    filename = "screenshot.png"
     try:
-        from PIL import ImageGrab
-        screenshot = ImageGrab.grab()
-        filename = "screenshot.png"
-        screenshot.save(filename)
+        if os.name == 'nt':
+            # Windows: Use PowerShell method which is more reliable for GH Actions
+            ps_cmd = (
+                "powershell -command \"[Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms') | Out-Null; "
+                "[Reflection.Assembly]::LoadWithPartialName('System.Drawing') | Out-Null; "
+                "$Screen = [System.Windows.Forms.Screen]::PrimaryScreen; "
+                "$Bitmap = New-Object System.Drawing.Bitmap($Screen.Bounds.Width, $Screen.Bounds.Height); "
+                "$Graphics = [System.Drawing.Graphics]::FromImage($Bitmap); "
+                "$Graphics.CopyFromScreen(0, 0, 0, 0, $Bitmap.Size); "
+                "$Bitmap.Save('screenshot.png', [System.Drawing.Imaging.ImageFormat]::Png); "
+                "$Graphics.Dispose(); $Bitmap.Dispose();\""
+            )
+            subprocess.run(ps_cmd, shell=True, check=True)
+        else:
+            # Linux/Other: Try Pillow
+            from PIL import ImageGrab
+            screenshot = ImageGrab.grab()
+            screenshot.save(filename)
+
         send_photo(chat_id, filename)
-        os.remove(filename)
+        if os.path.exists(filename):
+            os.remove(filename)
     except Exception as e:
-        send_message(chat_id, f"Screenshot error: {e}")
+        # Final fallback attempt with Pillow
+        try:
+            from PIL import ImageGrab
+            screenshot = ImageGrab.grab()
+            screenshot.save(filename)
+            send_photo(chat_id, filename)
+            if os.path.exists(filename): os.remove(filename)
+        except Exception as e2:
+            send_message(chat_id, f"Screenshot error: {e}\nFallback error: {e2}\nNote: If on Linux, ensure 'xvfb' is running or 'scrot' is installed.")
 
 WELCOME = (
     "*GitHub VM Bot*\n\n"
