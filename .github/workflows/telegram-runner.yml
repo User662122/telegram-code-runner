@@ -23,7 +23,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests mss numpy opencv-python-headless flask
+          pip install requests mss numpy opencv-python-headless flask pillow
 
       - name: Start Runner
         shell: cmd
