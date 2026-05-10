@@ -188,7 +188,7 @@ def livestream(chat_id):
                     frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
                     if last_frame is not None:
                         diff = cv2.absdiff(frame, last_frame)
-                        if np.mean(diff) < 0.2: # Even more aggressive diff
+                        if np.mean(diff) < 0.2:
                             time.sleep(0.2); continue
                     last_frame = frame.copy()
                     _, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 30])
@@ -197,7 +197,6 @@ def livestream(chat_id):
 
             @app.route("/")
             def index():
-                # Basic HTML wrapper for the MJPEG stream
                 return """
                 <html>
                   <head><title>GitHub VM Live</title></head>
@@ -211,8 +210,9 @@ def livestream(chat_id):
             def stream(): return Response(gen(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
             send_message(chat_id, "Starting Cloudflare tunnel...")
-            cf_proc = subprocess.Popen(["cloudflared", "tunnel", "--url", "http://127.0.0.1:5000"],
-                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            # Windows: Run cloudflared.exe from its installation path
+            cf_cmd = ["cloudflared", "tunnel", "--url", "http://127.0.0.1:5000"]
+            cf_proc = subprocess.Popen(cf_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
 
             url = None
             start_time = time.time()
@@ -227,8 +227,7 @@ def livestream(chat_id):
             if url: send_message(chat_id, f"LiveStream online: {url}")
             else: send_message(chat_id, "Failed to capture Cloudflare URL.")
 
-            # Using threaded=True and host='127.0.0.1' for Cloudflare local binding
-            app.run(host="127.0.0.1", port=5000, threaded=True)
+            app.run(host="0.0.0.0", port=5000, threaded=True) # Bind to all interfaces
         except Exception as e: send_message(chat_id, f"LiveStream Error: {e}")
 
     threading.Thread(target=run_server, daemon=True).start()
