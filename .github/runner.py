@@ -102,13 +102,12 @@ def ui_automation(chat_id, action, params=None):
             send_message(chat_id, "Opened Apps:\n" + "\n".join(wins))
 
         elif action == "available_apps":
-            apps = {} # Name -> Full Path
+            apps = {}
             try:
                 for path in [os.path.join(os.environ['USERPROFILE'], 'Desktop'), r'C:\Users\Public\Desktop']:
                     if os.path.exists(path):
                         for f in os.listdir(path):
                             if f.endswith('.lnk'): apps[f.replace('.lnk', '')] = os.path.join(path, f)
-
                 for path in [os.path.join(os.environ['AppData'], r'Microsoft\Windows\Start Menu\Programs'),
                              r'C:\ProgramData\Microsoft\Windows\Start Menu\Programs']:
                     if os.path.exists(path):
@@ -121,42 +120,31 @@ def ui_automation(chat_id, action, params=None):
                 res = sorted(list(apps.keys()))
                 send_message(chat_id, "Available Apps:\n" + ("\n".join(res[:100]) or "None found"))
             else:
-                # Open the app
                 target = params.lower()
                 match = next((path for name, path in apps.items() if name.lower() == target), None)
                 if not match:
-                    # Try common system app names directly
                     common = {"paint": "mspaint", "notepad": "notepad", "calc": "calc", "cmd": "cmd", "explorer": "explorer"}
                     match = common.get(target)
-
                 if match:
                     os.startfile(match) if os.path.exists(match) else subprocess.Popen(match)
                     send_message(chat_id, f"Opening `{params}`...")
                 else:
-                    send_message(chat_id, f"Could not find app `{params}`. Use `apps` to see available names.")
+                    send_message(chat_id, f"Could not find app `{params}`.")
 
         elif action == "list_buttons":
             curr_win = auto.GetForegroundControl()
             while curr_win and curr_win.ControlTypeName != "WindowControl":
                 curr_win = curr_win.GetParentControl()
             if not curr_win: send_message(chat_id, "No active window found."); return
-
             controls = []
             def find_controls(ctrl):
-                interactive_types = [
-                    "ButtonControl", "MenuItemControl", "ListItemControl",
-                    "TreeItemControl", "TabItemControl", "HyperlinkControl",
-                    "SplitButtonControl", "CheckBoxControl", "RadioButtonControl"
-                ]
+                interactive_types = ["ButtonControl", "MenuItemControl", "ListItemControl", "TreeItemControl", "TabItemControl", "HyperlinkControl", "SplitButtonControl", "CheckBoxControl", "RadioButtonControl"]
                 if ctrl.ControlTypeName in interactive_types:
                     if ctrl.Name: controls.append(f"{ctrl.ControlTypeName[:-7]}: {ctrl.Name}")
                 if len(controls) > 100: return
-                for child in ctrl.GetChildren():
-                    find_controls(child)
-
+                for child in ctrl.GetChildren(): find_controls(child)
             find_controls(curr_win)
-            unique_controls = sorted(list(set(controls)))
-            res = "\n".join(unique_controls[:60])
+            res = "\n".join(sorted(list(set(controls)))[:60])
             send_message(chat_id, f"Controls in `{curr_win.Name}`:\n" + (res or "No controls found"))
 
         elif action == "click" or action == "double_click":
@@ -181,7 +169,59 @@ def ui_automation(chat_id, action, params=None):
 
     except Exception as e: send_message(chat_id, f"UI Error: {e}")
 
-WELCOME = "*GitHub VM Bot*\n- `screen`: Screenshot\n- `terminate`: Kill task\n- `apps`: Available apps\n- `open <app>`: Open an app\n- `opened apps`: Running apps\n- `buttons`: List controls\n- `click <name>`: Click\n- `double click <name>`: Double-click\n- `press <keys>`: Hotkeys\n- `type <text>`: Type text"
+def livestream(chat_id):
+    def run_server():
+        try:
+            from flask import Flask, Response
+            from PIL import ImageGrab
+            import numpy as np
+            import cv2
+            import io
+
+            app = Flask(__name__)
+            last_frame = None
+
+            def gen():
+                nonlocal last_frame
+                while True:
+                    img = ImageGrab.grab()
+                    frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+                    if last_frame is not None:
+                        # Only send diff if needed, but for MJPEG we typically send full frames.
+                        # Simple diff-based skipping to save bandwidth:
+                        diff = cv2.absdiff(frame, last_frame)
+                        if np.mean(diff) < 1.0: # Very little change
+                            time.sleep(0.1); continue
+
+                    last_frame = frame.copy()
+                    _, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
+                    yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+                    time.sleep(0.1)
+
+            @app.route("/")
+            def index(): return Response(gen(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+            # Start Cloudflared
+            cf_proc = subprocess.Popen(["cloudflared", "tunnel", "--url", "http://localhost:5000"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+            # Extract URL from cloudflared output
+            url = None
+            start_time = time.time()
+            while time.time() - start_time < 30:
+                line = cf_proc.stdout.readline()
+                if "trycloudflare.com" in line:
+                    url = line.strip().split(" ")[-1]; break
+
+            if url: send_message(chat_id, f"LiveStream started: {url}")
+            else: send_message(chat_id, "Failed to start Cloudflare tunnel.")
+
+            app.run(host="0.0.0.0", port=5000, threaded=True)
+        except Exception as e: send_message(chat_id, f"LiveStream Error: {e}")
+
+    threading.Thread(target=run_server, daemon=True).start()
+
+WELCOME = "*GitHub VM Bot*\n- `screen`: Screenshot\n- `livestream`: Live screen view\n- `terminate`: Kill task\n- `apps`: Available apps\n- `opened apps`: Running apps\n- `buttons`: List controls\n- `click <name>`: Click\n- `open <app>`: Launch app"
 
 if not TOKEN: sys.exit(1)
 try:
@@ -206,6 +246,7 @@ while True:
             if text in ("/start", "/help"): send_message(chat_id, WELCOME); continue
             if text == "/stop": sys.exit(0)
             if text == "screen": take_screenshot(chat_id); continue
+            if text == "livestream": livestream(chat_id); continue
             if text == "terminate":
                 if current_process: current_process.terminate(); send_message(chat_id, "Terminated.")
                 else: send_message(chat_id, "No task.")
