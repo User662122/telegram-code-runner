@@ -188,18 +188,30 @@ def livestream(chat_id):
                     frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
                     if last_frame is not None:
                         diff = cv2.absdiff(frame, last_frame)
-                        if np.mean(diff) < 0.3: # Even more aggressive diff
-                            time.sleep(0.1); continue
+                        if np.mean(diff) < 0.2: # Even more aggressive diff
+                            time.sleep(0.2); continue
                     last_frame = frame.copy()
-                    _, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 40])
+                    _, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 30])
                     yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
                     time.sleep(0.1)
 
             @app.route("/")
-            def index(): return Response(gen(), mimetype='multipart/x-mixed-replace; boundary=frame')
+            def index():
+                # Basic HTML wrapper for the MJPEG stream
+                return """
+                <html>
+                  <head><title>GitHub VM Live</title></head>
+                  <body style="margin:0; background: #000; display:flex; align-items:center; justify-content:center;">
+                    <img src="/stream" style="max-width:100%; max-height:100vh;">
+                  </body>
+                </html>
+                """
+
+            @app.route("/stream")
+            def stream(): return Response(gen(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
             send_message(chat_id, "Starting Cloudflare tunnel...")
-            cf_proc = subprocess.Popen(["cloudflared", "tunnel", "--url", "http://localhost:5000"],
+            cf_proc = subprocess.Popen(["cloudflared", "tunnel", "--url", "http://127.0.0.1:5000"],
                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
 
             url = None
@@ -213,9 +225,10 @@ def livestream(chat_id):
                     url = match.group(0); break
 
             if url: send_message(chat_id, f"LiveStream online: {url}")
-            else: send_message(chat_id, "Failed to capture Cloudflare URL. Ensure cloudflared is in PATH.")
+            else: send_message(chat_id, "Failed to capture Cloudflare URL.")
 
-            app.run(host="0.0.0.0", port=5000, threaded=True)
+            # Using threaded=True and host='127.0.0.1' for Cloudflare local binding
+            app.run(host="127.0.0.1", port=5000, threaded=True)
         except Exception as e: send_message(chat_id, f"LiveStream Error: {e}")
 
     threading.Thread(target=run_server, daemon=True).start()
