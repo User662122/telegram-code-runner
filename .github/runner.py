@@ -211,28 +211,32 @@ def livestream(chat_id):
 
             send_message(chat_id, "Starting Cloudflare tunnel...")
 
-            # Start the Flask app in its own thread to avoid blocking
+            # Start the Flask app in its own thread
             threading.Thread(target=lambda: app.run(host="127.0.0.1", port=5000, threaded=True), daemon=True).start()
-
-            # Wait for flask to start
             time.sleep(2)
 
-            # Start cloudflared
-            cf_proc = subprocess.Popen(["cloudflared", "tunnel", "--url", "http://127.0.0.1:5000"],
-                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            # Use full path to cloudflared if needed, or assume in path
+            cf_cmd = ["cloudflared", "tunnel", "--url", "http://127.0.0.1:5000"]
+            # Set environment variable to skip update check which might block
+            env = os.environ.copy()
+            env["TUNNEL_ORIGIN_CERT"] = ""
+
+            cf_proc = subprocess.Popen(cf_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
 
             url = None
             start_time = time.time()
+            log_output = ""
             while time.time() - start_time < 90:
                 line = cf_proc.stdout.readline()
                 if not line: break
+                log_output += line
                 print(f"[cf] {line.strip()}", flush=True)
                 match = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', line)
                 if match:
                     url = match.group(0); break
 
             if url: send_message(chat_id, f"LiveStream online: {url}")
-            else: send_message(chat_id, "Failed to capture Cloudflare URL. Ensure cloudflared is installed.")
+            else: send_message(chat_id, f"Failed to capture Cloudflare URL. Output:\n{log_output[-500:]}")
 
         except Exception as e: send_message(chat_id, f"LiveStream Error: {e}")
 
