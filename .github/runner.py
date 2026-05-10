@@ -210,9 +210,16 @@ def livestream(chat_id):
             def stream(): return Response(gen(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
             send_message(chat_id, "Starting Cloudflare tunnel...")
-            # Windows: Run cloudflared.exe from its installation path
-            cf_cmd = ["cloudflared", "tunnel", "--url", "http://127.0.0.1:5000"]
-            cf_proc = subprocess.Popen(cf_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+
+            # Start the Flask app in its own thread to avoid blocking
+            threading.Thread(target=lambda: app.run(host="127.0.0.1", port=5000, threaded=True), daemon=True).start()
+
+            # Wait for flask to start
+            time.sleep(2)
+
+            # Start cloudflared
+            cf_proc = subprocess.Popen(["cloudflared", "tunnel", "--url", "http://127.0.0.1:5000"],
+                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
 
             url = None
             start_time = time.time()
@@ -225,9 +232,8 @@ def livestream(chat_id):
                     url = match.group(0); break
 
             if url: send_message(chat_id, f"LiveStream online: {url}")
-            else: send_message(chat_id, "Failed to capture Cloudflare URL.")
+            else: send_message(chat_id, "Failed to capture Cloudflare URL. Ensure cloudflared is installed.")
 
-            app.run(host="0.0.0.0", port=5000, threaded=True) # Bind to all interfaces
         except Exception as e: send_message(chat_id, f"LiveStream Error: {e}")
 
     threading.Thread(target=run_server, daemon=True).start()
