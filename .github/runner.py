@@ -102,10 +102,8 @@ def ui_automation(chat_id, action, params=None):
             send_message(chat_id, "Opened Apps:\n" + "\n".join(wins))
 
         elif action == "available_apps":
-            # List items in Start Menu or common locations
             apps = []
             try:
-                # Desktop icons as a proxy for available apps
                 desktop = os.path.join(os.environ['USERPROFILE'], 'Desktop')
                 apps = [f.replace('.lnk', '') for f in os.listdir(desktop) if f.endswith('.lnk')]
             except: pass
@@ -117,26 +115,34 @@ def ui_automation(chat_id, action, params=None):
                 curr_win = curr_win.GetParentControl()
             if not curr_win: send_message(chat_id, "No active window found."); return
 
-            # More aggressive button search including deep children
-            btns = []
-            def find_btns(ctrl):
-                if ctrl.ControlTypeName in ["ButtonControl", "MenuItemControl", "ListItemControl"]:
-                    if ctrl.Name: btns.append(f"{ctrl.ControlTypeName}: {ctrl.Name}")
+            controls = []
+            def find_controls(ctrl):
+                interactive_types = [
+                    "ButtonControl", "MenuItemControl", "ListItemControl",
+                    "TreeItemControl", "TabItemControl", "HyperlinkControl",
+                    "SplitButtonControl", "CheckBoxControl", "RadioButtonControl"
+                ]
+                if ctrl.ControlTypeName in interactive_types:
+                    if ctrl.Name: controls.append(f"{ctrl.ControlTypeName[:-7]}: {ctrl.Name}")
+                if len(controls) > 100: return
                 for child in ctrl.GetChildren():
-                    find_btns(child)
+                    find_controls(child)
 
-            find_btns(curr_win)
-            res = "\n".join(list(set(btns))[:50]) # Limit output
+            find_controls(curr_win)
+            unique_controls = sorted(list(set(controls)))
+            res = "\n".join(unique_controls[:60])
             send_message(chat_id, f"Controls in `{curr_win.Name}`:\n" + (res or "No controls found"))
 
-        elif action == "click":
-            def find_and_click(ctrl, target):
+        elif action == "click" or action == "double_click":
+            def perform_action(ctrl, target):
                 if target.lower() in (ctrl.Name or "").lower():
-                    ctrl.Click(); return True
+                    if action == "click": ctrl.Click()
+                    else: ctrl.DoubleClick()
+                    return True
                 for child in ctrl.GetChildren():
-                    if find_and_click(child, target): return True
+                    if perform_action(child, target): return True
                 return False
-            if find_and_click(root, params): send_message(chat_id, f"Clicked `{params}`")
+            if perform_action(root, params): send_message(chat_id, f"{'Clicked' if action == 'click' else 'Double-clicked'} `{params}`")
             else: send_message(chat_id, f"Could not find `{params}`")
 
         elif action == "press":
@@ -149,7 +155,7 @@ def ui_automation(chat_id, action, params=None):
 
     except Exception as e: send_message(chat_id, f"UI Error: {e}")
 
-WELCOME = "*GitHub VM Bot*\n- `screen`: Screenshot\n- `terminate`: Kill task\n- `apps`: Available apps\n- `opened apps`: Currently running apps\n- `buttons`: List controls in active window\n- `click <name>`: Click something\n- `press <keys>`: Hotkeys\n- `type <text>`: Type text"
+WELCOME = "*GitHub VM Bot*\n- `screen`: Screenshot\n- `terminate`: Kill task\n- `apps`: Available apps\n- `opened apps`: Running apps\n- `buttons`: List controls\n- `click <name>`: Click\n- `double click <name>`: Double-click\n- `press <keys>`: Hotkeys\n- `type <text>`: Type text"
 
 if not TOKEN: sys.exit(1)
 try:
@@ -183,6 +189,7 @@ while True:
             if text == "apps": ui_automation(chat_id, "available_apps"); continue
             if text == "buttons": ui_automation(chat_id, "list_buttons"); continue
             if text.startswith("click "): ui_automation(chat_id, "click", text[6:].strip()); continue
+            if text.startswith("double click "): ui_automation(chat_id, "double_click", text[13:].strip()); continue
             if text.startswith("press "): ui_automation(chat_id, "press", text[6:].strip()); continue
             if text.startswith("type "): ui_automation(chat_id, "type", text[5:].strip()); continue
 
