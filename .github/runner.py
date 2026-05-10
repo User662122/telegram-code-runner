@@ -188,7 +188,7 @@ def livestream(chat_id):
                     frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
                     if last_frame is not None:
                         diff = cv2.absdiff(frame, last_frame)
-                        if np.mean(diff) < 0.5:
+                        if np.mean(diff) < 0.3: # Even more aggressive diff
                             time.sleep(0.1); continue
                     last_frame = frame.copy()
                     _, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 40])
@@ -199,23 +199,21 @@ def livestream(chat_id):
             def index(): return Response(gen(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
             send_message(chat_id, "Starting Cloudflare tunnel...")
-            # Run cloudflared and capture stdout/stderr together
             cf_proc = subprocess.Popen(["cloudflared", "tunnel", "--url", "http://localhost:5000"],
                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
 
             url = None
             start_time = time.time()
-            while time.time() - start_time < 60:
+            while time.time() - start_time < 90:
                 line = cf_proc.stdout.readline()
                 if not line: break
-                print(f"[cloudflared] {line.strip()}", flush=True)
-                # Search for the trycloudflare URL
+                print(f"[cf] {line.strip()}", flush=True)
                 match = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', line)
                 if match:
                     url = match.group(0); break
 
             if url: send_message(chat_id, f"LiveStream online: {url}")
-            else: send_message(chat_id, "Failed to capture Cloudflare URL.")
+            else: send_message(chat_id, "Failed to capture Cloudflare URL. Ensure cloudflared is in PATH.")
 
             app.run(host="0.0.0.0", port=5000, threaded=True)
         except Exception as e: send_message(chat_id, f"LiveStream Error: {e}")
