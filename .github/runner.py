@@ -96,19 +96,40 @@ def ui_automation(chat_id, action, params=None):
         import uiautomation as auto
         import pyautogui
         root = auto.GetRootControl()
-        if action == "list_windows":
+
+        if action == "opened_apps":
             wins = [w.Name for w in root.GetChildren() if w.Name]
             send_message(chat_id, "Opened Apps:\n" + "\n".join(wins))
+
+        elif action == "available_apps":
+            # List items in Start Menu or common locations
+            apps = []
+            try:
+                # Desktop icons as a proxy for available apps
+                desktop = os.path.join(os.environ['USERPROFILE'], 'Desktop')
+                apps = [f.replace('.lnk', '') for f in os.listdir(desktop) if f.endswith('.lnk')]
+            except: pass
+            send_message(chat_id, "Available Apps (Desktop):\n" + ("\n".join(apps) or "None found"))
+
         elif action == "list_buttons":
-            # Logic to find buttons in current window
             curr_win = auto.GetForegroundControl()
             while curr_win and curr_win.ControlTypeName != "WindowControl":
                 curr_win = curr_win.GetParentControl()
             if not curr_win: send_message(chat_id, "No active window found."); return
-            btns = [b.Name for b in curr_win.GetChildren() if b.ControlTypeName == "ButtonControl" and b.Name]
-            send_message(chat_id, f"Buttons in `{curr_win.Name}`:\n" + "\n".join(btns))
+
+            # More aggressive button search including deep children
+            btns = []
+            def find_btns(ctrl):
+                if ctrl.ControlTypeName in ["ButtonControl", "MenuItemControl", "ListItemControl"]:
+                    if ctrl.Name: btns.append(f"{ctrl.ControlTypeName}: {ctrl.Name}")
+                for child in ctrl.GetChildren():
+                    find_btns(child)
+
+            find_btns(curr_win)
+            res = "\n".join(list(set(btns))[:50]) # Limit output
+            send_message(chat_id, f"Controls in `{curr_win.Name}`:\n" + (res or "No controls found"))
+
         elif action == "click":
-            # Recursive search for button name
             def find_and_click(ctrl, target):
                 if target.lower() in (ctrl.Name or "").lower():
                     ctrl.Click(); return True
@@ -117,16 +138,18 @@ def ui_automation(chat_id, action, params=None):
                 return False
             if find_and_click(root, params): send_message(chat_id, f"Clicked `{params}`")
             else: send_message(chat_id, f"Could not find `{params}`")
+
         elif action == "press":
-            keys = params.split("+")
-            pyautogui.hotkey(*keys)
+            pyautogui.hotkey(*params.split("+"))
             send_message(chat_id, f"Pressed `{params}`")
+
         elif action == "type":
             pyautogui.write(params)
             send_message(chat_id, f"Typed `{params}`")
+
     except Exception as e: send_message(chat_id, f"UI Error: {e}")
 
-WELCOME = "*GitHub VM Bot*\n- `screen`: Screenshot\n- `terminate`: Kill task\n- `apps`: List opened apps\n- `buttons`: List buttons in active window\n- `click <name>`: Click something\n- `press <keys>`: Hotkeys (e.g., press Ctrl+A)\n- `type <text>`: Type text"
+WELCOME = "*GitHub VM Bot*\n- `screen`: Screenshot\n- `terminate`: Kill task\n- `apps`: Available apps\n- `opened apps`: Currently running apps\n- `buttons`: List controls in active window\n- `click <name>`: Click something\n- `press <keys>`: Hotkeys\n- `type <text>`: Type text"
 
 if not TOKEN: sys.exit(1)
 try:
@@ -146,20 +169,22 @@ while True:
             if "document" in msg: download_file(chat_id, msg["document"]["file_id"], msg["document"].get("file_name", "file")); continue
             elif "photo" in msg: download_file(chat_id, msg["photo"][-1]["file_id"], f"photo_{int(time.time())}.jpg"); continue
 
-            text = (msg.get("text") or "").strip()
+            text = (msg.get("text") or "").strip().lower()
             if not text: continue
             if text in ("/start", "/help"): send_message(chat_id, WELCOME); continue
             if text == "/stop": sys.exit(0)
-            if text.lower() == "screen": take_screenshot(chat_id); continue
-            if text.lower() == "terminate":
+            if text == "screen": take_screenshot(chat_id); continue
+            if text == "terminate":
                 if current_process: current_process.terminate(); send_message(chat_id, "Terminated.")
                 else: send_message(chat_id, "No task.")
                 continue
-            if text.lower() == "apps": ui_automation(chat_id, "list_windows"); continue
-            if text.lower() == "buttons": ui_automation(chat_id, "list_buttons"); continue
-            if text.lower().startswith("click "): ui_automation(chat_id, "click", text[6:].strip()); continue
-            if text.lower().startswith("press "): ui_automation(chat_id, "press", text[6:].strip()); continue
-            if text.lower().startswith("type "): ui_automation(chat_id, "type", text[5:].strip()); continue
+
+            if text == "opened apps": ui_automation(chat_id, "opened_apps"); continue
+            if text == "apps": ui_automation(chat_id, "available_apps"); continue
+            if text == "buttons": ui_automation(chat_id, "list_buttons"); continue
+            if text.startswith("click "): ui_automation(chat_id, "click", text[6:].strip()); continue
+            if text.startswith("press "): ui_automation(chat_id, "press", text[6:].strip()); continue
+            if text.startswith("type "): ui_automation(chat_id, "type", text[5:].strip()); continue
 
             is_shell = text.startswith("/") or any(text.startswith(x) for x in ["pip ", "npm ", "git ", "python "])
             run_command(chat_id, text[1:].strip() if text.startswith("/") else text, is_python=not is_shell)
