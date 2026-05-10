@@ -102,12 +102,23 @@ def ui_automation(chat_id, action, params=None):
             send_message(chat_id, "Opened Apps:\n" + "\n".join(wins))
 
         elif action == "available_apps":
-            apps = []
+            apps = set()
             try:
-                desktop = os.path.join(os.environ['USERPROFILE'], 'Desktop')
-                apps = [f.replace('.lnk', '') for f in os.listdir(desktop) if f.endswith('.lnk')]
+                # 1. Desktop
+                for path in [os.path.join(os.environ['USERPROFILE'], 'Desktop'), r'C:\Users\Public\Desktop']:
+                    if os.path.exists(path):
+                        apps.update([f.replace('.lnk', '') for f in os.listdir(path) if f.endswith('.lnk')])
+
+                # 2. Start Menu
+                for path in [os.path.join(os.environ['AppData'], r'Microsoft\Windows\Start Menu\Programs'),
+                             r'C:\ProgramData\Microsoft\Windows\Start Menu\Programs']:
+                    if os.path.exists(path):
+                        for root_dir, dirs, files in os.walk(path):
+                            apps.update([f.replace('.lnk', '') for f in files if f.endswith('.lnk')])
             except: pass
-            send_message(chat_id, "Available Apps (Desktop):\n" + ("\n".join(apps) or "None found"))
+
+            res = sorted(list(apps))
+            send_message(chat_id, "Available Apps:\n" + ("\n".join(res[:100]) or "None found"))
 
         elif action == "list_buttons":
             curr_win = auto.GetForegroundControl()
