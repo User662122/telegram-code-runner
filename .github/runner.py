@@ -7,6 +7,7 @@ import os
 import glob
 import threading
 import signal
+import re
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 ALLOWED_CHAT_ID = os.environ.get("ALLOWED_CHAT_ID")
@@ -176,7 +177,6 @@ def livestream(chat_id):
             from PIL import ImageGrab
             import numpy as np
             import cv2
-            import io
 
             app = Flask(__name__)
             last_frame = None
@@ -184,15 +184,12 @@ def livestream(chat_id):
             def gen():
                 nonlocal last_frame
                 while True:
-                    # Windows specific screen grab via PIL is reliable
                     img = ImageGrab.grab()
                     frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-
                     if last_frame is not None:
                         diff = cv2.absdiff(frame, last_frame)
-                        if np.mean(diff) < 0.5: # Extremely aggressive diff
+                        if np.mean(diff) < 0.5:
                             time.sleep(0.1); continue
-
                     last_frame = frame.copy()
                     _, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 40])
                     yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
@@ -201,25 +198,24 @@ def livestream(chat_id):
             @app.route("/")
             def index(): return Response(gen(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
-            # Start Cloudflared and capture output
             send_message(chat_id, "Starting Cloudflare tunnel...")
-            cf_proc = subprocess.Popen(["cloudflared", "tunnel", "--url", "http://localhost:5000"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            # Run cloudflared and capture stdout/stderr together
+            cf_proc = subprocess.Popen(["cloudflared", "tunnel", "--url", "http://localhost:5000"],
+                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
 
             url = None
             start_time = time.time()
-            # Loop to read output until URL is found or timeout
             while time.time() - start_time < 60:
                 line = cf_proc.stdout.readline()
                 if not line: break
-                if "trycloudflare.com" in line:
-                    parts = line.strip().split(" ")
-                    for p in parts:
-                        if "trycloudflare.com" in p:
-                            url = p; break
-                    if url: break
+                print(f"[cloudflared] {line.strip()}", flush=True)
+                # Search for the trycloudflare URL
+                match = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', line)
+                if match:
+                    url = match.group(0); break
 
             if url: send_message(chat_id, f"LiveStream online: {url}")
-            else: send_message(chat_id, "Failed to capture Cloudflare URL. Please check if cloudflared is installed.")
+            else: send_message(chat_id, "Failed to capture Cloudflare URL.")
 
             app.run(host="0.0.0.0", port=5000, threaded=True)
         except Exception as e: send_message(chat_id, f"LiveStream Error: {e}")
