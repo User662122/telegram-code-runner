@@ -102,23 +102,38 @@ def ui_automation(chat_id, action, params=None):
             send_message(chat_id, "Opened Apps:\n" + "\n".join(wins))
 
         elif action == "available_apps":
-            apps = set()
+            apps = {} # Name -> Full Path
             try:
-                # 1. Desktop
                 for path in [os.path.join(os.environ['USERPROFILE'], 'Desktop'), r'C:\Users\Public\Desktop']:
                     if os.path.exists(path):
-                        apps.update([f.replace('.lnk', '') for f in os.listdir(path) if f.endswith('.lnk')])
+                        for f in os.listdir(path):
+                            if f.endswith('.lnk'): apps[f.replace('.lnk', '')] = os.path.join(path, f)
 
-                # 2. Start Menu
                 for path in [os.path.join(os.environ['AppData'], r'Microsoft\Windows\Start Menu\Programs'),
                              r'C:\ProgramData\Microsoft\Windows\Start Menu\Programs']:
                     if os.path.exists(path):
                         for root_dir, dirs, files in os.walk(path):
-                            apps.update([f.replace('.lnk', '') for f in files if f.endswith('.lnk')])
+                            for f in files:
+                                if f.endswith('.lnk'): apps[f.replace('.lnk', '')] = os.path.join(root_dir, f)
             except: pass
 
-            res = sorted(list(apps))
-            send_message(chat_id, "Available Apps:\n" + ("\n".join(res[:100]) or "None found"))
+            if params == "list":
+                res = sorted(list(apps.keys()))
+                send_message(chat_id, "Available Apps:\n" + ("\n".join(res[:100]) or "None found"))
+            else:
+                # Open the app
+                target = params.lower()
+                match = next((path for name, path in apps.items() if name.lower() == target), None)
+                if not match:
+                    # Try common system app names directly
+                    common = {"paint": "mspaint", "notepad": "notepad", "calc": "calc", "cmd": "cmd", "explorer": "explorer"}
+                    match = common.get(target)
+
+                if match:
+                    os.startfile(match) if os.path.exists(match) else subprocess.Popen(match)
+                    send_message(chat_id, f"Opening `{params}`...")
+                else:
+                    send_message(chat_id, f"Could not find app `{params}`. Use `apps` to see available names.")
 
         elif action == "list_buttons":
             curr_win = auto.GetForegroundControl()
@@ -166,7 +181,7 @@ def ui_automation(chat_id, action, params=None):
 
     except Exception as e: send_message(chat_id, f"UI Error: {e}")
 
-WELCOME = "*GitHub VM Bot*\n- `screen`: Screenshot\n- `terminate`: Kill task\n- `apps`: Available apps\n- `opened apps`: Running apps\n- `buttons`: List controls\n- `click <name>`: Click\n- `double click <name>`: Double-click\n- `press <keys>`: Hotkeys\n- `type <text>`: Type text"
+WELCOME = "*GitHub VM Bot*\n- `screen`: Screenshot\n- `terminate`: Kill task\n- `apps`: Available apps\n- `open <app>`: Open an app\n- `opened apps`: Running apps\n- `buttons`: List controls\n- `click <name>`: Click\n- `double click <name>`: Double-click\n- `press <keys>`: Hotkeys\n- `type <text>`: Type text"
 
 if not TOKEN: sys.exit(1)
 try:
@@ -197,7 +212,8 @@ while True:
                 continue
 
             if text == "opened apps": ui_automation(chat_id, "opened_apps"); continue
-            if text == "apps": ui_automation(chat_id, "available_apps"); continue
+            if text == "apps": ui_automation(chat_id, "available_apps", "list"); continue
+            if text.startswith("open "): ui_automation(chat_id, "available_apps", text[5:].strip()); continue
             if text == "buttons": ui_automation(chat_id, "list_buttons"); continue
             if text.startswith("click "): ui_automation(chat_id, "click", text[6:].strip()); continue
             if text.startswith("double click "): ui_automation(chat_id, "double_click", text[13:].strip()); continue
