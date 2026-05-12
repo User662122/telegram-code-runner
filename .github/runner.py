@@ -21,6 +21,7 @@ current_process = None
 
 def send_message(chat_id, text, parse_mode='Markdown'):
     try:
+        if not text: return
         if len(text) > 4000: text = text[:3900] + "\n...(truncated)"
         return requests.post(f"{BASE}/sendMessage", json={"chat_id": chat_id, "text": text, "parse_mode": parse_mode}, timeout=10).json()
     except Exception as e: print(f"[send error] {e}", flush=True)
@@ -105,24 +106,26 @@ def ui_automation(chat_id, action, params=None):
         elif action == "available_apps":
             apps = {}
             try:
+                # Desktop
                 for path in [os.path.join(os.environ['USERPROFILE'], 'Desktop'), r'C:\Users\Public\Desktop']:
                     if os.path.exists(path):
                         for f in os.listdir(path):
-                            if f.endswith('.lnk'): apps[f.replace('.lnk', '')] = os.path.join(path, f)
-                for path in [os.path.join(os.environ['AppData'], r'Microsoft\Windows\Start Menu\Programs'),
+                            if f.endswith('.lnk'): apps[f.replace('.lnk', '').lower()] = os.path.join(path, f)
+                # Start Menu
+                for path in [os.path.join(os.environ.get('AppData', ''), r'Microsoft\Windows\Start Menu\Programs'),
                              r'C:\ProgramData\Microsoft\Windows\Start Menu\Programs']:
                     if os.path.exists(path):
                         for root_dir, dirs, files in os.walk(path):
                             for f in files:
-                                if f.endswith('.lnk'): apps[f.replace('.lnk', '')] = os.path.join(root_dir, f)
+                                if f.endswith('.lnk'): apps[f.replace('.lnk', '').lower()] = os.path.join(root_dir, f)
             except: pass
 
             if params == "list":
-                res = sorted(list(apps.keys()))
+                res = sorted([k.capitalize() for k in apps.keys()])
                 send_message(chat_id, "Available Apps:\n" + ("\n".join(res[:100]) or "None found"))
             else:
                 target = params.lower()
-                match = next((path for name, path in apps.items() if name.lower() == target), None)
+                match = apps.get(target)
                 if not match:
                     common = {"paint": "mspaint", "notepad": "notepad", "calc": "calc", "cmd": "cmd", "explorer": "explorer"}
                     match = common.get(target)
@@ -137,15 +140,19 @@ def ui_automation(chat_id, action, params=None):
             while curr_win and curr_win.ControlTypeName != "WindowControl":
                 curr_win = curr_win.GetParentControl()
             if not curr_win: send_message(chat_id, "No active window found."); return
+
             controls = []
-            def find_controls(ctrl):
+            def find_controls(ctrl, depth=0):
+                if depth > 8: return # Limit depth
                 interactive_types = ["ButtonControl", "MenuItemControl", "ListItemControl", "TreeItemControl", "TabItemControl", "HyperlinkControl", "SplitButtonControl", "CheckBoxControl", "RadioButtonControl"]
                 if ctrl.ControlTypeName in interactive_types:
                     if ctrl.Name: controls.append(f"{ctrl.ControlTypeName[:-7]}: {ctrl.Name}")
-                if len(controls) > 100: return
-                for child in ctrl.GetChildren(): find_controls(child)
+                if len(controls) > 150: return
+                for child in ctrl.GetChildren(): find_controls(child, depth + 1)
+
             find_controls(curr_win)
-            res = "\n".join(sorted(list(set(controls)))[:60])
+            unique_controls = sorted(list(set(controls)))
+            res = "\n".join(unique_controls[:80])
             send_message(chat_id, f"Controls in `{curr_win.Name}`:\n" + (res or "No controls found"))
 
         elif action == "click" or action == "double_click":
@@ -186,12 +193,17 @@ def livestream(chat_id):
                 while True:
                     img = ImageGrab.grab()
                     frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
                     if last_frame is not None:
                         diff = cv2.absdiff(frame, last_frame)
-                        if np.mean(diff) < 0.2:
-                            time.sleep(0.2); continue
+                        if np.mean(diff) < 0.15: # Aggressive diff for mobile
+                            time.sleep(0.3); continue
+
                     last_frame = frame.copy()
-                    _, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 30])
+                    # Resize to 50% for faster loading on mobile
+                    h, w = frame.shape[:2]
+                    frame_resized = cv2.resize(frame, (w // 2, h // 2))
+                    _, buffer = cv2.imencode(".jpg", frame_resized, [int(cv2.IMWRITE_JPEG_QUALITY), 15])
                     yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
                     time.sleep(0.1)
 
@@ -199,7 +211,7 @@ def livestream(chat_id):
             def index():
                 return """
                 <html>
-                  <head><title>GitHub VM Live</title></head>
+                  <head><title>GitHub VM Live</title><meta name="viewport" content="width=device-width, initial-scale=1"></head>
                   <body style="margin:0; background: #000; display:flex; align-items:center; justify-content:center;">
                     <img src="/stream" style="max-width:100%; max-height:100vh;">
                   </body>
@@ -211,13 +223,10 @@ def livestream(chat_id):
 
             send_message(chat_id, "Starting Cloudflare tunnel...")
 
-            # Start the Flask app in its own thread
-            threading.Thread(target=lambda: app.run(host="127.0.0.1", port=5000, threaded=True), daemon=True).start()
-            time.sleep(2)
+            threading.Thread(target=lambda: app.run(host="0.0.0.0", port=5000, threaded=True, debug=False), daemon=True).start()
+            time.sleep(3)
 
-            # Use full path to cloudflared if needed, or assume in path
             cf_cmd = ["cloudflared", "tunnel", "--url", "http://127.0.0.1:5000"]
-            # Set environment variable to skip update check which might block
             env = os.environ.copy()
             env["TUNNEL_ORIGIN_CERT"] = ""
 
@@ -236,7 +245,7 @@ def livestream(chat_id):
                     url = match.group(0); break
 
             if url: send_message(chat_id, f"LiveStream online: {url}")
-            else: send_message(chat_id, f"Failed to capture Cloudflare URL. Output:\n{log_output[-500:]}")
+            else: send_message(chat_id, f"Failed to capture Cloudflare URL. Logs:\n{log_output[-500:]}")
 
         except Exception as e: send_message(chat_id, f"LiveStream Error: {e}")
 
