@@ -20,6 +20,7 @@ TICK  = chr(96) * 3
 current_process = None
 livestream_proc = None
 livestream_url = None
+livestream_active = False
 
 def send_message(chat_id, text, parse_mode='Markdown'):
     try:
@@ -116,7 +117,6 @@ def ui_automation(chat_id, action, params=None):
                             for f in files:
                                 if f.endswith('.lnk'): apps[f.replace('.lnk', '').lower()] = os.path.join(root_dir, f)
             except: pass
-
             if params == "list":
                 res = sorted([k.capitalize() for k in apps.keys()])
                 send_message(chat_id, "Available Apps:\n" + ("\n".join(res[:100]) or "None found"))
@@ -137,7 +137,6 @@ def ui_automation(chat_id, action, params=None):
             while curr_win and curr_win.ControlTypeName != "WindowControl":
                 curr_win = curr_win.GetParentControl()
             if not curr_win: send_message(chat_id, "No active window found."); return
-
             controls = []
             def find_controls(ctrl, depth=0):
                 if depth > 8: return
@@ -146,7 +145,6 @@ def ui_automation(chat_id, action, params=None):
                     if ctrl.Name: controls.append(f"{ctrl.ControlTypeName[:-7]}: {ctrl.Name}")
                 if len(controls) > 150: return
                 for child in ctrl.GetChildren(): find_controls(child, depth + 1)
-
             find_controls(curr_win)
             unique_controls = sorted(list(set(controls)))
             res = "\n".join(unique_controls[:80])
@@ -174,14 +172,51 @@ def ui_automation(chat_id, action, params=None):
 
     except Exception as e: send_message(chat_id, f"UI Error: {e}")
 
+def run_tunnel_with_autorestart(chat_id, is_first=True):
+    """Start cloudflared tunnel and auto-restart when it dies. Runs forever."""
+    global livestream_proc, livestream_url, livestream_active
+    attempt = 0
+    while livestream_active:
+        attempt += 1
+        livestream_url = None
+        if not is_first or attempt > 1:
+            send_message(chat_id, f"Reconnecting tunnel (attempt {attempt})...")
+        try:
+            cf_cmd = ["cloudflared", "tunnel", "--url", "http://127.0.0.1:5000"]
+            env = os.environ.copy()
+            env["TUNNEL_ORIGIN_CERT"] = ""
+            livestream_proc = subprocess.Popen(
+                cf_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, env=env
+            )
+            url_sent = False
+            for line in iter(livestream_proc.stdout.readline, ''):
+                if not line or not livestream_active: break
+                print(f"[cf] {line.strip()}", flush=True)
+                if not url_sent:
+                    match = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', line)
+                    if match:
+                        livestream_url = match.group(0)
+                        url_sent = True
+                        send_message(chat_id, f"LiveStream online: {livestream_url}")
+            ret = livestream_proc.wait()
+            print(f"[cf] Tunnel exited (code {ret})", flush=True)
+            if not livestream_active: break
+            send_message(chat_id, "Tunnel disconnected, restarting in 5s...")
+            time.sleep(5)
+        except Exception as e:
+            print(f"[cf] Error: {e}", flush=True)
+            if not livestream_active: break
+            time.sleep(5)
+
 def livestream(chat_id):
-    global livestream_proc, livestream_url
-    if livestream_proc and livestream_proc.poll() is None:
-        send_message(chat_id, f"LiveStream already running: {livestream_url}")
+    global livestream_proc, livestream_url, livestream_active
+    if livestream_active:
+        send_message(chat_id, f"LiveStream already running: {livestream_url or '(connecting...)'}")
         return
 
     def run_server():
-        global livestream_proc, livestream_url
+        global livestream_proc, livestream_url, livestream_active
         try:
             from flask import Flask, Response
             import numpy as np
@@ -213,7 +248,7 @@ def livestream(chat_id):
     *{box-sizing:border-box;margin:0;padding:0}
     body{background:#000;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center}
     img{width:100%;height:auto;display:block}
-    #st{color:#888;font:12px monospace;padding:4px;text-align:center}
+    #st{color:#0f0;font:13px monospace;padding:6px;text-align:center;width:100%}
   </style>
 </head>
 <body>
@@ -229,15 +264,17 @@ def livestream(chat_id):
       nx.onload=function(){
         img.src=nx.src;
         errors=0;
+        if(delay>600)delay=600;
         frames++;
         var el=Date.now()-lastT;
-        if(el>=2000){st.textContent=Math.round(frames*1000/el)+' FPS';frames=0;lastT=Date.now();}
+        if(el>=2000){st.textContent=Math.round(frames*1000/el)+' FPS | Live';frames=0;lastT=Date.now();}
         setTimeout(load,Math.max(50,delay-(Date.now()-t)));
       };
       nx.onerror=function(){
         errors++;
-        if(errors>3)delay=Math.min(delay*2,4000);
-        setTimeout(load,1500);
+        st.textContent='Reconnecting... ('+errors+')';
+        delay=Math.min(delay*1.5,5000);
+        setTimeout(load,Math.min(errors*500,3000));
       };
       nx.src='/snapshot?t='+t;
     }
@@ -254,40 +291,38 @@ def livestream(chat_id):
                     data = capture_jpeg(width=640, quality=25)
                     return Response(data, mimetype='image/jpeg', headers={
                         'Cache-Control': 'no-store, no-cache, must-revalidate',
-                        'Pragma': 'no-cache',
-                        'Expires': '0'
+                        'Pragma': 'no-cache', 'Expires': '0'
                     })
                 except Exception as e:
                     return Response(f"Error: {e}", status=500)
 
+            @app.route("/stop-stream")
+            def stop_stream():
+                global livestream_active
+                livestream_active = False
+                if livestream_proc: livestream_proc.terminate()
+                return Response("Stopped", mimetype='text/plain')
+
+            livestream_active = True
             send_message(chat_id, "Starting LiveStream...")
-            threading.Thread(target=lambda: app.run(host="0.0.0.0", port=5000, threaded=True, debug=False), daemon=True).start()
+            threading.Thread(
+                target=lambda: app.run(host="0.0.0.0", port=5000, threaded=True, debug=False),
+                daemon=True
+            ).start()
             time.sleep(2)
 
-            cf_cmd = ["cloudflared", "tunnel", "--url", "http://127.0.0.1:5000"]
-            env = os.environ.copy()
-            env["TUNNEL_ORIGIN_CERT"] = ""
+            # Start tunnel with auto-restart in background thread
+            threading.Thread(
+                target=run_tunnel_with_autorestart, args=(chat_id, True), daemon=True
+            ).start()
 
-            livestream_proc = subprocess.Popen(cf_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
-
-            def drain_output():
-                global livestream_url
-                for line in iter(livestream_proc.stdout.readline, ''):
-                    if not line: break
-                    print(f"[cf] {line.strip()}", flush=True)
-                    if not livestream_url:
-                        match = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', line)
-                        if match:
-                            livestream_url = match.group(0)
-                            send_message(chat_id, f"LiveStream online: {livestream_url}")
-
-            threading.Thread(target=drain_output, daemon=True).start()
-
-        except Exception as e: send_message(chat_id, f"LiveStream Error: {e}")
+        except Exception as e:
+            livestream_active = False
+            send_message(chat_id, f"LiveStream Error: {e}")
 
     threading.Thread(target=run_server, daemon=True).start()
 
-WELCOME = "*GitHub VM Bot*\n- `screen`: Screenshot\n- `livestream`: Live screen view\n- `terminate`: Kill task\n- `apps`: Available apps\n- `opened apps`: Running apps\n- `buttons`: List controls\n- `click <name>`: Click\n- `open <app>`: Launch app"
+WELCOME = "*GitHub VM Bot*\n- `screen`: Screenshot\n- `livestream`: Live screen view\n- `stop stream`: Stop livestream\n- `terminate`: Kill task\n- `apps`: Available apps\n- `opened apps`: Running apps\n- `buttons`: List controls\n- `click <name>`: Click\n- `open <app>`: Launch app"
 
 if not TOKEN: sys.exit(1)
 try:
@@ -315,6 +350,12 @@ while True:
             if text == "/stop": sys.exit(0)
             if text == "screen": take_screenshot(chat_id); continue
             if text == "livestream": livestream(chat_id); continue
+            if text == "stop stream":
+                global livestream_active
+                livestream_active = False
+                if livestream_proc: livestream_proc.terminate()
+                send_message(chat_id, "LiveStream stopped.")
+                continue
             if text == "terminate":
                 if current_process: current_process.terminate(); send_message(chat_id, "Terminated.")
                 else: send_message(chat_id, "No task.")
