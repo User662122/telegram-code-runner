@@ -143,7 +143,7 @@ def ui_automation(chat_id, action, params=None):
 
             controls = []
             def find_controls(ctrl, depth=0):
-                if depth > 8: return # Limit depth
+                if depth > 8: return
                 interactive_types = ["ButtonControl", "MenuItemControl", "ListItemControl", "TreeItemControl", "TabItemControl", "HyperlinkControl", "SplitButtonControl", "CheckBoxControl", "RadioButtonControl"]
                 if ctrl.ControlTypeName in interactive_types:
                     if ctrl.Name: controls.append(f"{ctrl.ControlTypeName[:-7]}: {ctrl.Name}")
@@ -180,46 +180,53 @@ def ui_automation(chat_id, action, params=None):
 def livestream(chat_id):
     def run_server():
         try:
-            from flask import Flask, Response
+            from flask import Flask, Response, send_file
             from PIL import ImageGrab
             import numpy as np
             import cv2
+            import io
 
             app = Flask(__name__)
-            last_frame = None
+            last_frame_bytes = None
 
-            def gen():
-                nonlocal last_frame
-                while True:
-                    img = ImageGrab.grab()
-                    frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-
-                    if last_frame is not None:
-                        diff = cv2.absdiff(frame, last_frame)
-                        if np.mean(diff) < 0.15: # Aggressive diff for mobile
-                            time.sleep(0.3); continue
-
-                    last_frame = frame.copy()
-                    # Resize to 50% for faster loading on mobile
-                    h, w = frame.shape[:2]
-                    frame_resized = cv2.resize(frame, (w // 2, h // 2))
-                    _, buffer = cv2.imencode(".jpg", frame_resized, [int(cv2.IMWRITE_JPEG_QUALITY), 15])
-                    yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-                    time.sleep(0.1)
+            def get_frame():
+                nonlocal last_frame_bytes
+                img = ImageGrab.grab()
+                frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+                h, w = frame.shape[:2]
+                # Lower resolution and quality for mobile
+                frame_resized = cv2.resize(frame, (w // 2, h // 2))
+                _, buffer = cv2.imencode(".jpg", frame_resized, [int(cv2.IMWRITE_JPEG_QUALITY), 20])
+                last_frame_bytes = buffer.tobytes()
+                return last_frame_bytes
 
             @app.route("/")
             def index():
                 return """
                 <html>
-                  <head><title>GitHub VM Live</title><meta name="viewport" content="width=device-width, initial-scale=1"></head>
-                  <body style="margin:0; background: #000; display:flex; align-items:center; justify-content:center;">
-                    <img src="/stream" style="max-width:100%; max-height:100vh;">
+                  <head>
+                    <title>GitHub VM Live</title>
+                    <meta name="viewport" content="width=device-width, initial-scale=1">
+                    <style>
+                      body { margin:0; background: #000; display:flex; align-items:center; justify-content:center; }
+                      img { max-width:100%; max-height:100vh; }
+                    </style>
+                  </head>
+                  <body>
+                    <img id="stream" src="/frame">
+                    <script>
+                      const img = document.getElementById('stream');
+                      setInterval(() => {
+                        img.src = '/frame?t=' + Date.now();
+                      }, 500); // 2 FPS is plenty for remote management
+                    </script>
                   </body>
                 </html>
                 """
 
-            @app.route("/stream")
-            def stream(): return Response(gen(), mimetype='multipart/x-mixed-replace; boundary=frame')
+            @app.route("/frame")
+            def frame():
+                return Response(get_frame(), mimetype='image/jpeg')
 
             send_message(chat_id, "Starting Cloudflare tunnel...")
 
