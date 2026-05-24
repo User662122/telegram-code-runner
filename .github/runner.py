@@ -105,12 +105,10 @@ def ui_automation(chat_id, action, params=None):
         elif action == "available_apps":
             apps = {}
             try:
-                # Desktop
                 for path in [os.path.join(os.environ['USERPROFILE'], 'Desktop'), r'C:\Users\Public\Desktop']:
                     if os.path.exists(path):
                         for f in os.listdir(path):
                             if f.endswith('.lnk'): apps[f.replace('.lnk', '').lower()] = os.path.join(path, f)
-                # Start Menu
                 for path in [os.path.join(os.environ.get('AppData', ''), r'Microsoft\Windows\Start Menu\Programs'),
                              r'C:\ProgramData\Microsoft\Windows\Start Menu\Programs']:
                     if os.path.exists(path):
@@ -193,49 +191,74 @@ def livestream(chat_id):
             app = Flask(__name__)
             sct = mss.mss()
 
-            def gen_frames():
-                while True:
-                    try:
-                        monitor = sct.monitors[1]
-                        sct_img = sct.grab(monitor)
-                        frame = np.array(sct_img)
-                        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-                        h, w = frame.shape[:2]
-                        new_w = 854
-                        new_h = int(h * (new_w / w))
-                        frame_resized = cv2.resize(frame, (new_w, new_h))
-                        _, buffer = cv2.imencode(".jpg", frame_resized, [int(cv2.IMWRITE_JPEG_QUALITY), 40])
-                        frame_bytes = buffer.tobytes()
-                        yield (b'--frame\r\n'
-                               b'Content-Type: image/jpeg\r\n'
-                               b'Content-Length: ' + str(len(frame_bytes)).encode() + b'\r\n\r\n' +
-                               frame_bytes + b'\r\n')
-                        time.sleep(0.15)
-                    except Exception as e:
-                        print(f"Frame gen error: {e}")
-                        time.sleep(1)
+            def capture_jpeg(width=640, quality=25):
+                monitor = sct.monitors[1]
+                sct_img = sct.grab(monitor)
+                frame = np.array(sct_img)
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+                h, w = frame.shape[:2]
+                new_h = int(h * (width / w))
+                frame_resized = cv2.resize(frame, (width, new_h))
+                _, buffer = cv2.imencode(".jpg", frame_resized, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+                return buffer.tobytes()
 
             @app.route("/")
             def index():
-                return """
-                <html>
-                  <head>
-                    <title>GitHub VM Live</title>
-                    <meta name="viewport" content="width=device-width, initial-scale=1">
-                    <style>
-                      body { margin:0; background: #000; height: 100vh; display:flex; align-items:center; justify-content:center; }
-                      img { width:100%; height:auto; object-fit: contain; }
-                    </style>
-                  </head>
-                  <body>
-                    <img src="/stream">
-                  </body>
-                </html>
-                """
+                html = """<!DOCTYPE html>
+<html>
+<head>
+  <title>GitHub VM Live</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{background:#000;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center}
+    img{width:100%;height:auto;display:block}
+    #st{color:#888;font:12px monospace;padding:4px;text-align:center}
+  </style>
+</head>
+<body>
+  <div id="st">Connecting...</div>
+  <img id="f" src="/snapshot">
+  <script>
+    var img=document.getElementById('f');
+    var st=document.getElementById('st');
+    var frames=0,lastT=Date.now(),errors=0,delay=600;
+    function load(){
+      var t=Date.now();
+      var nx=new Image();
+      nx.onload=function(){
+        img.src=nx.src;
+        errors=0;
+        frames++;
+        var el=Date.now()-lastT;
+        if(el>=2000){st.textContent=Math.round(frames*1000/el)+' FPS';frames=0;lastT=Date.now();}
+        setTimeout(load,Math.max(50,delay-(Date.now()-t)));
+      };
+      nx.onerror=function(){
+        errors++;
+        if(errors>3)delay=Math.min(delay*2,4000);
+        setTimeout(load,1500);
+      };
+      nx.src='/snapshot?t='+t;
+    }
+    img.onload=function(){st.textContent='Live';};
+    load();
+  </script>
+</body>
+</html>"""
+                return Response(html, mimetype='text/html')
 
-            @app.route("/stream")
-            def stream():
-                return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+            @app.route("/snapshot")
+            def snapshot():
+                try:
+                    data = capture_jpeg(width=640, quality=25)
+                    return Response(data, mimetype='image/jpeg', headers={
+                        'Cache-Control': 'no-store, no-cache, must-revalidate',
+                        'Pragma': 'no-cache',
+                        'Expires': '0'
+                    })
+                except Exception as e:
+                    return Response(f"Error: {e}", status=500)
 
             send_message(chat_id, "Starting LiveStream...")
             threading.Thread(target=lambda: app.run(host="0.0.0.0", port=5000, threaded=True, debug=False), daemon=True).start()
@@ -247,7 +270,6 @@ def livestream(chat_id):
 
             livestream_proc = subprocess.Popen(cf_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
 
-            # Continuous drain thread to prevent pipe stall
             def drain_output():
                 global livestream_url
                 for line in iter(livestream_proc.stdout.readline, ''):
