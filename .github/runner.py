@@ -202,42 +202,23 @@ def livestream(chat_id):
             sct = mss.mss()
 
             def gen_frames():
-                last_frame = None
-                last_send_time = 0
                 while True:
                     try:
                         monitor = sct.monitors[1]
                         sct_img = sct.grab(monitor)
                         frame = np.array(sct_img)
                         frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-
                         h, w = frame.shape[:2]
                         new_w = 854
                         new_h = int(h * (new_w / w))
                         frame_resized = cv2.resize(frame, (new_w, new_h))
-
-                        current_time = time.time()
-                        send_now = False
-
-                        if last_frame is None or (current_time - last_send_time) > 2:
-                            send_now = True
-                        else:
-                            # Simple frame difference
-                            diff = cv2.absdiff(frame_resized, last_frame)
-                            if np.mean(diff) > 0.4: # Slightly more sensitive
-                                send_now = True
-
-                        if send_now:
-                            _, buffer = cv2.imencode(".jpg", frame_resized, [int(cv2.IMWRITE_JPEG_QUALITY), 35])
-                            frame_bytes = buffer.tobytes()
-                            yield (b'--frame\r\n'
-                                   b'Content-Type: image/jpeg\r\n'
-                                   b'Content-Length: ' + str(len(frame_bytes)).encode() + b'\r\n\r\n' +
-                                   frame_bytes + b'\r\n')
-                            last_frame = frame_resized
-                            last_send_time = current_time
-
-                        time.sleep(0.2)
+                        _, buffer = cv2.imencode(".jpg", frame_resized, [int(cv2.IMWRITE_JPEG_QUALITY), 40])
+                        frame_bytes = buffer.tobytes()
+                        yield (b'--frame\r\n'
+                               b'Content-Type: image/jpeg\r\n'
+                               b'Content-Length: ' + str(len(frame_bytes)).encode() + b'\r\n\r\n' +
+                               frame_bytes + b'\r\n')
+                        time.sleep(0.15)
                     except Exception as e:
                         print(f"Frame gen error: {e}")
                         time.sleep(1)
