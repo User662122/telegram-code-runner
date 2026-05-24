@@ -179,16 +179,8 @@ def ui_automation(chat_id, action, params=None):
 def livestream(chat_id):
     global livestream_proc, livestream_url
     if livestream_proc and livestream_proc.poll() is None:
-        if livestream_url:
-            send_message(chat_id, f"LiveStream already running: {livestream_url}")
-            return
-        else:
-            send_message(chat_id, "LiveStream starting, please wait...")
-            return
-
-    # Reset state if process is dead
-    livestream_proc = None
-    livestream_url = None
+        send_message(chat_id, f"LiveStream already running: {livestream_url}")
+        return
 
     def run_server():
         global livestream_proc, livestream_url
@@ -257,22 +249,15 @@ def livestream(chat_id):
 
             # Continuous drain thread to prevent pipe stall
             def drain_output():
-                global livestream_url, livestream_proc
-                try:
-                    for line in iter(livestream_proc.stdout.readline, ''):
-                        if not line: break
-                        print(f"[cf] {line.strip()}", flush=True)
-                        if not livestream_url:
-                            match = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', line)
-                            if match:
-                                livestream_url = match.group(0)
-                                send_message(chat_id, f"LiveStream online: {livestream_url}")
-                except: pass
-                finally:
-                    if livestream_url:
-                        send_message(chat_id, "LiveStream tunnel closed.")
-                    livestream_url = None
-                    livestream_proc = None
+                global livestream_url
+                for line in iter(livestream_proc.stdout.readline, ''):
+                    if not line: break
+                    print(f"[cf] {line.strip()}", flush=True)
+                    if not livestream_url:
+                        match = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', line)
+                        if match:
+                            livestream_url = match.group(0)
+                            send_message(chat_id, f"LiveStream online: {livestream_url}")
 
             threading.Thread(target=drain_output, daemon=True).start()
 
