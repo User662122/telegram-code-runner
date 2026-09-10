@@ -7,7 +7,6 @@ import os
 import glob
 import threading
 import signal
-import re
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 ALLOWED_CHAT_ID = os.environ.get("ALLOWED_CHAT_ID")
@@ -18,9 +17,6 @@ BASE  = f"https://api.telegram.org/bot{TOKEN}"
 TICK  = chr(96) * 3
 
 current_process = None
-livestream_proc = None
-livestream_url = None
-livestream_active = False
 
 def send_message(chat_id, text, parse_mode='Markdown'):
     try:
@@ -172,157 +168,7 @@ def ui_automation(chat_id, action, params=None):
 
     except Exception as e: send_message(chat_id, f"UI Error: {e}")
 
-def run_tunnel_with_autorestart(chat_id, is_first=True):
-    """Start cloudflared tunnel and auto-restart when it dies. Runs forever."""
-    global livestream_proc, livestream_url, livestream_active
-    attempt = 0
-    while livestream_active:
-        attempt += 1
-        livestream_url = None
-        if not is_first or attempt > 1:
-            send_message(chat_id, f"Reconnecting tunnel (attempt {attempt})...")
-        try:
-            cf_cmd = ["cloudflared", "tunnel", "--url", "http://127.0.0.1:5000"]
-            env = os.environ.copy()
-            env["TUNNEL_ORIGIN_CERT"] = ""
-            livestream_proc = subprocess.Popen(
-                cf_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1, env=env
-            )
-            url_sent = False
-            for line in iter(livestream_proc.stdout.readline, ''):
-                if not line or not livestream_active: break
-                print(f"[cf] {line.strip()}", flush=True)
-                if not url_sent:
-                    match = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', line)
-                    if match:
-                        livestream_url = match.group(0)
-                        url_sent = True
-                        send_message(chat_id, f"LiveStream online: {livestream_url}")
-            ret = livestream_proc.wait()
-            print(f"[cf] Tunnel exited (code {ret})", flush=True)
-            if not livestream_active: break
-            send_message(chat_id, "Tunnel disconnected, restarting in 5s...")
-            time.sleep(5)
-        except Exception as e:
-            print(f"[cf] Error: {e}", flush=True)
-            if not livestream_active: break
-            time.sleep(5)
-
-def livestream(chat_id):
-    global livestream_proc, livestream_url, livestream_active
-    if livestream_active:
-        send_message(chat_id, f"LiveStream already running: {livestream_url or '(connecting...)'}")
-        return
-
-    def run_server():
-        global livestream_proc, livestream_url, livestream_active
-        try:
-            from flask import Flask, Response
-            import numpy as np
-            import cv2
-            import mss
-
-            app = Flask(__name__)
-            sct = mss.mss()
-
-            def capture_jpeg(width=640, quality=25):
-                monitor = sct.monitors[1]
-                sct_img = sct.grab(monitor)
-                frame = np.array(sct_img)
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-                h, w = frame.shape[:2]
-                new_h = int(h * (width / w))
-                frame_resized = cv2.resize(frame, (width, new_h))
-                _, buffer = cv2.imencode(".jpg", frame_resized, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
-                return buffer.tobytes()
-
-            @app.route("/")
-            def index():
-                html = """<!DOCTYPE html>
-<html>
-<head>
-  <title>GitHub VM Live</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <style>
-    *{box-sizing:border-box;margin:0;padding:0}
-    body{background:#000;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center}
-    img{width:100%;height:auto;display:block}
-    #st{color:#0f0;font:13px monospace;padding:6px;text-align:center;width:100%}
-  </style>
-</head>
-<body>
-  <div id="st">Connecting...</div>
-  <img id="f" src="/snapshot">
-  <script>
-    var img=document.getElementById('f');
-    var st=document.getElementById('st');
-    var frames=0,lastT=Date.now(),errors=0,delay=600;
-    function load(){
-      var t=Date.now();
-      var nx=new Image();
-      nx.onload=function(){
-        img.src=nx.src;
-        errors=0;
-        if(delay>600)delay=600;
-        frames++;
-        var el=Date.now()-lastT;
-        if(el>=2000){st.textContent=Math.round(frames*1000/el)+' FPS | Live';frames=0;lastT=Date.now();}
-        setTimeout(load,Math.max(50,delay-(Date.now()-t)));
-      };
-      nx.onerror=function(){
-        errors++;
-        st.textContent='Reconnecting... ('+errors+')';
-        delay=Math.min(delay*1.5,5000);
-        setTimeout(load,Math.min(errors*500,3000));
-      };
-      nx.src='/snapshot?t='+t;
-    }
-    img.onload=function(){st.textContent='Live';};
-    load();
-  </script>
-</body>
-</html>"""
-                return Response(html, mimetype='text/html')
-
-            @app.route("/snapshot")
-            def snapshot():
-                try:
-                    data = capture_jpeg(width=640, quality=25)
-                    return Response(data, mimetype='image/jpeg', headers={
-                        'Cache-Control': 'no-store, no-cache, must-revalidate',
-                        'Pragma': 'no-cache', 'Expires': '0'
-                    })
-                except Exception as e:
-                    return Response(f"Error: {e}", status=500)
-
-            @app.route("/stop-stream")
-            def stop_stream():
-                global livestream_active
-                livestream_active = False
-                if livestream_proc: livestream_proc.terminate()
-                return Response("Stopped", mimetype='text/plain')
-
-            livestream_active = True
-            send_message(chat_id, "Starting LiveStream...")
-            threading.Thread(
-                target=lambda: app.run(host="0.0.0.0", port=5000, threaded=True, debug=False),
-                daemon=True
-            ).start()
-            time.sleep(2)
-
-            # Start tunnel with auto-restart in background thread
-            threading.Thread(
-                target=run_tunnel_with_autorestart, args=(chat_id, True), daemon=True
-            ).start()
-
-        except Exception as e:
-            livestream_active = False
-            send_message(chat_id, f"LiveStream Error: {e}")
-
-    threading.Thread(target=run_server, daemon=True).start()
-
-WELCOME = "*GitHub VM Bot*\n- `screen`: Screenshot\n- `livestream`: Live screen view\n- `stop stream`: Stop livestream\n- `terminate`: Kill task\n- `apps`: Available apps\n- `opened apps`: Running apps\n- `buttons`: List controls\n- `click <name>`: Click\n- `open <app>`: Launch app"
+WELCOME = "*GitHub VM Bot*\n- `screen` / `screenshot`: Screenshot\n- `terminate`: Kill task\n- `apps`: Available apps\n- `open <app>`: Open an app\n- `opened apps`: Running apps\n- `buttons`: List controls\n- `click <name>`: Click\n- `double click <name>`: Double-click\n- `press <keys>`: Hotkeys\n- `type <text>`: Type text"
 
 if not TOKEN: sys.exit(1)
 try:
@@ -348,13 +194,8 @@ while True:
 
             if text in ("/start", "/help"): send_message(chat_id, WELCOME); continue
             if text == "/stop": sys.exit(0)
-            if text == "screen": take_screenshot(chat_id); continue
-            if text == "livestream": livestream(chat_id); continue
-            if text == "stop stream":
-                global livestream_active
-                livestream_active = False
-                if livestream_proc: livestream_proc.terminate()
-                send_message(chat_id, "LiveStream stopped.")
+            if text in ("screen", "screenshot", "/screen", "/screenshot"):
+                take_screenshot(chat_id)
                 continue
             if text == "terminate":
                 if current_process: current_process.terminate(); send_message(chat_id, "Terminated.")
