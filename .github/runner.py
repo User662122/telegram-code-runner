@@ -168,7 +168,7 @@ def ui_automation(chat_id, action, params=None):
 
     except Exception as e: send_message(chat_id, f"UI Error: {e}")
 
-WELCOME = "*GitHub VM Bot*\n- `screen`: Screenshot\n- `terminate`: Kill task\n- `apps`: Available apps\n- `open <app>`: Open an app\n- `opened apps`: Running apps\n- `buttons`: List controls\n- `click <name>`: Click\n- `double click <name>`: Double-click\n- `press <keys>`: Hotkeys\n- `type <text>`: Type text"
+WELCOME = "*GitHub VM Bot*\n- `screen` / `screenshot`: Screenshot\n- `terminate`: Kill task\n- `apps`: Available apps\n- `open <app>`: Open an app\n- `opened apps`: Running apps\n- `buttons`: List controls\n- `click <name>`: Click\n- `double click <name>`: Double-click\n- `press <keys>`: Hotkeys\n- `type <text>`: Type text"
 
 if not TOKEN: sys.exit(1)
 try:
@@ -194,7 +194,9 @@ while True:
 
             if text in ("/start", "/help"): send_message(chat_id, WELCOME); continue
             if text == "/stop": sys.exit(0)
-            if text == "screen": take_screenshot(chat_id); continue
+            if text in ("screen", "screenshot", "/screen", "/screenshot"):
+                take_screenshot(chat_id)
+                continue
             if text == "terminate":
                 if current_process: current_process.terminate(); send_message(chat_id, "Terminated.")
                 else: send_message(chat_id, "No task.")
