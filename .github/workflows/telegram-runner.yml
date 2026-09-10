@@ -23,12 +23,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests mss numpy opencv-python flask pillow uiautomation pyautogui
-
-      - name: Install Cloudflared
-        run: |
-          curl -L --output cloudflared.exe https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe
-          move cloudflared.exe C:\Windows\System32\
+          pip install requests mss numpy opencv-python-headless flask pillow uiautomation pyautogui
 
       - name: Start Runner
         shell: cmd
