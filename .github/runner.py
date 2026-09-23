@@ -1318,15 +1318,16 @@ def _is_port_open(port=5000, host="127.0.0.1", timeout=1):
         return False
 
 def run_tunnel_with_autorestart(chat_id, is_first=True):
-    """Start cloudflared tunnel and auto-restart when it dies. Robust: waits for Flask, times out, shows logs."""
+    """Start cloudflared tunnel and auto-restart when it dies. Robust: waits for Flask, handles buffering, verbose diags."""
     global livestream_proc, livestream_url, livestream_active
+    import queue
     attempt = 0
     while livestream_active:
         attempt += 1
         livestream_url = None
         if not is_first or attempt > 1:
             send_message(chat_id, f"Reconnecting tunnel (attempt {attempt})...")
-        # Wait for Flask to be ready
+        # Wait for Flask to be ready with verbose check
         flask_ready = False
         for i in range(15):
             if not livestream_active:
@@ -1337,191 +1338,272 @@ def run_tunnel_with_autorestart(chat_id, is_first=True):
             time.sleep(1)
         if not flask_ready:
             print("[cf] Flask not ready after 15s, still trying...", flush=True)
-            send_message(chat_id, "Waiting for web server... Flask not responding on port 5000 yet. Retrying...")
-        # Find binary
+            send_message(chat_id, "Waiting for web server... Flask not responding on port 5000 yet. Diagnostics: " + ("port open" if _is_port_open(5000) else "port CLOSED") + ". Retrying...")
+        # Preflight diagnostics
         cfd = _find_cloudflared()
-        # Check binary exists
-        exists = shutil.which(cfd) or os.path.exists(cfd) if os.path.isabs(cfd) else shutil.which(cfd)
-        if not exists and not os.path.exists(r"C:\\Windows\\System32\\cloudflared.exe"):
-            print(f"[cf] cloudflared not found: {cfd}", flush=True)
+        # Test cloudflared binary
         try:
-            # Try with --no-autoupdate first, fallback without
-            tried_cmds = [
-                [cfd, "tunnel", "--url", "http://127.0.0.1:5000", "--no-autoupdate"],
-                [cfd, "tunnel", "--url", "http://127.0.0.1:5000"],
-                [cfd, "tunnel", "--url", "http://localhost:5000"],
-            ]
-            cf_cmd = tried_cmds[0]
-            env = os.environ.copy()
-            env["TUNNEL_ORIGIN_CERT"] = ""
-            # Try to start, if FileNotFound try next
+            ver = subprocess.run([cfd, "--version"], capture_output=True, text=True, timeout=8)
+            ver_out = (ver.stdout or "") + (ver.stderr or "")
+            print(f"[cf-preflight] {cfd} --version: {ver_out.strip()}", flush=True)
+            # Also test Flask reachability
+            try:
+                import socket
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(2)
+                s.connect(("127.0.0.1", 5000))
+                # try http get
+                s.sendall(b"GET / HTTP/1.0\r\n\r\n")
+                data = s.recv(1024).decode(errors='ignore')
+                s.close()
+                print(f"[cf-preflight] Flask probe: {data[:200]!r}", flush=True)
+            except Exception as fe:
+                print(f"[cf-preflight] Flask probe failed: {fe}", flush=True)
+        except Exception as e:
+            print(f"[cf-preflight] version check failed {e}", flush=True)
+        # Existence check
+        exists = shutil.which(cfd) or (os.path.exists(cfd) if os.path.isabs(cfd) else False)
+        if not exists and os.path.exists(r"C:\\Windows\\System32\\cloudflared.exe"):
+            cfd = r"C:\\Windows\\System32\\cloudflared.exe"
+            exists = True
+        if not exists:
+            print(f"[cf] cloudflared not found: {cfd}", flush=True)
+            send_message(chat_id, f"cloudflared not found at `{cfd}`. Checking PATH... `{os.environ.get('PATH','')[:500]}`")
+        # Command variants: try plain first (known working from backup), then verbose, then protocol variants
+        # Do NOT use --no-autoupdate as first try - it caused silent hang with no output on newer versions
+        env = os.environ.copy()
+        env["TUNNEL_ORIGIN_CERT"] = ""
+        env["NO_COLOR"] = "1"
+        env["FORCE_COLOR"] = "0"
+        env["CLOUDFLARED_NO_AUTOUPDATE"] = "1"
+        # Determine which command to try this attempt (rotate on retries)
+        base_cmds = [
+            [cfd, "tunnel", "--url", "http://127.0.0.1:5000"],
+            [cfd, "tunnel", "--url", "http://localhost:5000"],
+            [cfd, "tunnel", "--url", "http://127.0.0.1:5000", "--protocol", "http2"],
+            [cfd, "tunnel", "--url", "http://127.0.0.1:5000", "--loglevel", "debug"],
+            [cfd, "tunnel", "--url", "http://127.0.0.1:5000", "--no-autoupdate"],
+        ]
+        # Rotate based on attempt number to avoid sticking on bad flag
+        tried_order = base_cmds[(attempt-1) % len(base_cmds):] + base_cmds[:(attempt-1) % len(base_cmds)]
+        # Also on attempt >3, try with edge-ip-version
+        if attempt > 3:
+            tried_order.append([cfd, "tunnel", "--url", "http://127.0.0.1:5000", "--edge-ip-version", "auto"])
+        livestream_proc = None
+        chosen_cmd = None
+        logs = []
+        try:
+            url_sent = False
             started = False
             last_err = None
-            for cmd in tried_cmds:
+            for cmd in tried_order:
                 try:
                     print(f"[cf] Trying: {' '.join(cmd)}", flush=True)
+                    # Use separate pipes for stdout/stderr to catch both
+                    # Use creationflags to avoid extra window on Windows
+                    create_flags = 0
+                    if os.name == 'nt':
+                        try:
+                            create_flags = subprocess.CREATE_NO_WINDOW
+                        except:
+                            create_flags = 0x08000000
                     livestream_proc = subprocess.Popen(
-                        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        text=True, bufsize=1, env=env
+                        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        text=True, bufsize=1, env=env, creationflags=create_flags
                     )
+                    chosen_cmd = cmd
                     started = True
-                    cf_cmd = cmd
                     break
                 except FileNotFoundError as e:
                     last_err = e
+                    print(f"[cf] FileNotFound for {' '.join(cmd)}: {e}", flush=True)
+                    continue
+                except Exception as e:
+                    last_err = e
+                    print(f"[cf] Popen failed for {' '.join(cmd)}: {e}", flush=True)
                     continue
             if not started:
-                raise FileNotFoundError(f"cloudflared not found ({cfd}): {last_err}. Reinstalling...")
-            # Wait for URL with timeout 45s using single reader thread
-            url_sent = False
-            logs = []
-            start = time.time()
-            q = None
-            reader_alive = True
-            try:
-                import queue
-                q = queue.Queue()
-                def _reader():
-                    try:
-                        for ln in iter(livestream_proc.stdout.readline, ''):
-                            if not livestream_active:
-                                break
-                            if ln is None:
-                                break
-                            q.put(ln)
-                            if livestream_proc.poll() is not None and not ln:
-                                break
-                    except Exception as e:
-                        print(f"[cf-reader] {e}", flush=True)
-                        q.put(None)
-                    finally:
-                        q.put(None)
-                rt = threading.Thread(target=_reader, daemon=True)
-                rt.start()
-                # Wait up to 45s for URL
-                while livestream_active and time.time() - start < 45:
-                    if livestream_proc.poll() is not None:
-                        # process died early, drain queue quickly
-                        try:
-                            while not q.empty():
-                                ln = q.get_nowait()
-                                if ln and ln.strip():
-                                    logs.append(ln.strip())
-                                    print(f"[cf] {ln.strip()}", flush=True)
-                        except:
-                            pass
-                        break
-                    try:
-                        line = q.get(timeout=1)
-                    except queue.Empty:
-                        continue
-                    if line is None:
-                        # EOF
-                        if livestream_proc.poll() is not None:
+                raise FileNotFoundError(f"cloudflared not found ({cfd}): {last_err}")
+            # Pump both stdout and stderr into single queue
+            q = queue.Queue()
+            def _pump(stream, name):
+                try:
+                    for ln in iter(stream.readline, ''):
+                        if ln is None:
                             break
+                        if not ln and livestream_proc.poll() is not None:
+                            break
+                        if not livestream_active and not url_sent:
+                            # keep reading a bit to drain
+                            pass
+                        q.put((name, ln))
+                        if livestream_proc.poll() is not None and not ln:
+                            break
+                    q.put((name, None))
+                except Exception as e:
+                    print(f"[cf-pump-{name}] {e}", flush=True)
+                    q.put((name, None))
+            threading.Thread(target=_pump, args=(livestream_proc.stdout, "out"), daemon=True).start()
+            threading.Thread(target=_pump, args=(livestream_proc.stderr, "err"), daemon=True).start()
+            start = time.time()
+            # Heuristic: quick tunnel usually shows URL within 10-15s
+            timeout_sec = 40
+            while livestream_active and time.time() - start < timeout_sec:
+                # Check if proc died early
+                if livestream_proc.poll() is not None:
+                    # drain quickly
+                    drained = 0
+                    while drained < 20:
+                        try:
+                            name, ln = q.get_nowait()
+                            if ln and ln.strip():
+                                clean = re.sub(r'\x1b\[[^m]*m', '', ln.strip())
+                                logs.append(f"[{name}] {clean}")
+                                print(f"[cf-{name}] {clean}", flush=True)
+                            drained += 1
+                        except queue.Empty:
+                            break
+                    break
+                try:
+                    name, line = q.get(timeout=1)
+                except queue.Empty:
+                    continue
+                if line is None:
+                    # stream closed
+                    if livestream_proc.poll() is not None:
+                        # check other stream still maybe alive, continue a bit
+                        if q.empty() and livestream_proc.poll() is not None:
+                            # give a moment for other pump to push
+                            time.sleep(0.5)
+                            if q.empty():
+                                break
                         continue
-                    line = line.strip()
-                    if not line:
+                    else:
                         continue
-                    # Strip ANSI codes for URL detection
-                    clean_line = re.sub(r'\x1b\[[^m]*m', '', line)
-                    logs.append(clean_line)
-                    if len(logs) > 80:
-                        logs = logs[-80:]
-                    print(f"[cf] {clean_line}", flush=True)
-                    if not url_sent:
-                        m = re.search(r'https://[a-zA-Z0-9\-]+\.trycloudflare\.com[^\s\x1b]*', clean_line)
-                        if m:
-                            # strip ANSI remnants and punctuation
-                            raw = m.group(0)
-                            raw = re.sub(r'\x1b\[[^m]*m', '', raw)
-                            livestream_url = raw.rstrip('.,)"\']')
+                raw = line.strip()
+                if not raw:
+                    continue
+                clean = re.sub(r'\x1b\[[^m]*m', '', raw)
+                logs.append(f"[{name}] {clean}")
+                if len(logs) > 120:
+                    logs = logs[-120:]
+                print(f"[cf-{name}] {clean}", flush=True)
+                if not url_sent:
+                    # Broad URL detection - handle both streams and ANSI
+                    m = re.search(r'https://[a-zA-Z0-9\-]+\.trycloudflare\.com[^\s\x1b"\']*', clean)
+                    if m:
+                        raw_url = re.sub(r'\x1b\[[^m]*m', '', m.group(0)).rstrip('.,)"\']')
+                        livestream_url = raw_url
+                        url_sent = True
+                        send_message(chat_id, f"Live Remote Desktop online: {livestream_url}\nOpen on phone/PC for full control (tap/click, type, keyboard)\nTried: `{' '.join(chosen_cmd)}`\nIf page shows 502, wait 5s and refresh. Use `livestream status` / `restart` if stuck.")
+                    elif "trycloudflare.com" in clean and "https://" in clean:
+                        mm = re.search(r'https://[^\s]+trycloudflare\.com[^\s]*', clean)
+                        if mm:
+                            raw_url = re.sub(r'\x1b\[[^m]*m', '', mm.group(0)).rstrip('.,)"\']')
+                            livestream_url = raw_url
                             url_sent = True
-                            send_message(chat_id, f"Live Remote Desktop online: {livestream_url}\nOpen on phone/PC for full control (tap to click, type, keyboard)\nIf page shows 502, wait 5s and refresh. Use `livestream status` or `livestream restart` if stuck.")
-                        elif "trycloudflare.com" in clean_line and "https://" in clean_line:
-                            mm = re.search(r'https://[^\s]+trycloudflare\.com[^\s]*', clean_line)
-                            if mm:
-                                raw = re.sub(r'\x1b\[[^m]*m', '', mm.group(0))
-                                livestream_url = raw.rstrip('.,)"\']')
-                                url_sent = True
-                                send_message(chat_id, f"Live Remote Desktop online: {livestream_url}\nOpen on phone/PC for full control")
-                    # Also detect common fatal errors early
-                    if not url_sent and ("failed" in clean_line.lower() and "quic" not in clean_line.lower()):
-                        # keep logging but not break; wait a bit more
-                        pass
-            except Exception as e:
-                print(f"[cf] wait error {e}", flush=True)
+                            send_message(chat_id, f"Live Remote Desktop online: {livestream_url}\nOpen on phone/PC for full control\nTried: `{' '.join(chosen_cmd)}`")
+                # Log errors verbosely
+                if "error" in clean.lower() or "failed" in clean.lower():
+                    # keep but don't break
+                    pass
             if not url_sent:
-                # Timeout: send diagnostics
-                err_logs = "\n".join(logs[-25:]) if logs else "(no output)"
-                # Check if process is still alive
                 alive = livestream_proc.poll() is None
                 ret = livestream_proc.poll()
-                diag = f"Tunnel failed to get URL after 45s (attempt {attempt}). Alive={alive} exit={ret}\nLast logs:\n{TICK}\n{err_logs}\n{TICK}\n"
-                # Check common reasons
-                if any("failed" in l.lower() or "error" in l.lower() for l in logs):
-                    diag += "\nCheck firewall / network. Retrying in 5s..."
-                else:
-                    diag += "\nRetrying in 5s... If repeated, run `livestream restart` or `sysinfo` to check VM."
+                # Try to get extra diagnostics: netstat, curl, cloudflared help
+                extra = ""
+                try:
+                    # Quick curl test to Flask
+                    import socket as _sock
+                    _s = _sock.socket()
+                    _s.settimeout(2)
+                    _s.connect(("127.0.0.1", 5000))
+                    _s.sendall(b"GET / HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
+                    _resp = _s.recv(512).decode(errors='ignore')
+                    extra += f"\nFlask probe: {_resp[:300]!r}"
+                    _s.close()
+                except Exception as _e:
+                    extra += f"\nFlask probe failed: {_e}"
+                try:
+                    _ver = subprocess.run([cfd, "--version"], capture_output=True, text=True, timeout=5)
+                    extra += f"\ncloudflared --version: {(_ver.stdout or _ver.stderr or '').strip()[:200]}"
+                except Exception as _e:
+                    extra += f"\nversion check err: {_e}"
+                try:
+                    _where = subprocess.run("where cloudflared" if os.name=='nt' else "which -a cloudflared", shell=True, capture_output=True, text=True, timeout=5)
+                    extra += f"\nwhere cloudflared: {(_where.stdout or _where.stderr or '').strip()[:300]}"
+                except:
+                    pass
+                err_logs = "\n".join(logs[-30:]) if logs else "(no output - binary produced nothing for 40s! Checking diagnostics...\n" + extra + ")"
+                diag = f"Tunnel failed to get URL after {timeout_sec}s (attempt {attempt} cmd=`{' '.join(chosen_cmd)}`). Alive={alive} exit={ret}\nLast logs:\n{TICK}\n{err_logs}\n{TICK}\nExtra: {extra}\n\nNext try will rotate command. If repeated 3x with no output, network may block trycloudflare.com. Try `sysinfo` and `livestream restart`. Also ensure workflow installed cloudflared: `cloudflared --version` should print."
                 send_message(chat_id, diag)
                 try:
                     livestream_proc.terminate()
                 except:
                     pass
                 try:
-                    livestream_proc.wait(timeout=3)
+                    livestream_proc.wait(timeout=4)
                 except:
                     try:
                         livestream_proc.kill()
                     except:
                         pass
+                # Close pipes to unblock pumps
+                try:
+                    livestream_proc.stdout.close()
+                except:
+                    pass
+                try:
+                    livestream_proc.stderr.close()
+                except:
+                    pass
                 if not livestream_active:
                     break
                 time.sleep(5)
                 continue
-            # URL obtained, now monitor tunnel until it dies via queue
-            print(f"[cf] Tunnel online at {livestream_url}, monitoring...", flush=True)
-            # Continue draining via same queue, monitor for exit
+            # URL obtained, monitor via queue
+            print(f"[cf] Tunnel online at {livestream_url}, monitoring with cmd {' '.join(chosen_cmd)} ...", flush=True)
+            # Monitoring loop: drain queue until proc dies or stopped
             while livestream_active and livestream_proc.poll() is None:
                 try:
-                    line = q.get(timeout=2)
+                    name, line = q.get(timeout=2)
                     if line is None:
                         if livestream_proc.poll() is not None:
-                            break
+                            # check if other stream still has data
+                            if q.empty():
+                                time.sleep(0.3)
+                                if q.empty() and livestream_proc.poll() is not None:
+                                    break
+                            continue
                         continue
-                    line = line.strip()
-                    if line:
-                        print(f"[cf] {line}", flush=True)
-                except:
-                    # timeout, check still alive
+                    raw = line.strip()
+                    if raw:
+                        clean = re.sub(r'\x1b\[[^m]*m', '', raw)
+                        print(f"[cf-{name}] {clean}", flush=True)
+                except queue.Empty:
                     continue
-            # Drain any remaining logs
-            try:
-                while not q.empty():
-                    ln = q.get_nowait()
-                    if ln and ln.strip():
-                        print(f"[cf] {ln.strip()}", flush=True)
-            except:
-                pass
             ret = livestream_proc.poll()
             print(f"[cf] Tunnel exited (code {ret})", flush=True)
             if not livestream_active:
                 break
-            send_message(chat_id, f"Tunnel disconnected (code {ret}), restarting in 5s... If frequent, try `livestream status`.")
+            send_message(chat_id, f"Tunnel disconnected (code {ret}), restarting in 5s... Use `livestream status`.")
             time.sleep(5)
         except FileNotFoundError as e:
             print(f"[cf] FileNotFound: {e}", flush=True)
-            send_message(chat_id, f"cloudflared binary not found: {e}\nAttempting reinstall. If persists, check workflow Install Cloudflared step. Retrying in 10s...")
-            # Try to reinstall quickly on Windows
+            send_message(chat_id, f"cloudflared binary not found: {e}\nAttempting reinstall...")
             try:
                 if os.name == 'nt':
-                    subprocess.run("curl -L --output cloudflared.exe https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe", shell=True, timeout=30)
-                    subprocess.run("move /Y cloudflared.exe C:\\Windows\\System32\\", shell=True, timeout=10)
+                    subprocess.run("curl -L --output cloudflared.exe https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe", shell=True, timeout=35)
+                    subprocess.run("move /Y cloudflared.exe C:\\Windows\\System32\\cloudflared.exe", shell=True, timeout=10)
+                    # Verify
+                    vr = subprocess.run(["cloudflared", "--version"], capture_output=True, text=True, timeout=5)
+                    send_message(chat_id, f"Reinstall check: {(vr.stdout or vr.stderr or '').strip()[:300]}")
             except Exception as re:
                 print(f"[cf] reinstall failed {re}", flush=True)
             time.sleep(10)
         except Exception as e:
-            print(f"[cf] Error: {e}", flush=True)
+            import traceback
+            print(f"[cf] Error: {e}\n{traceback.format_exc()}", flush=True)
             send_message(chat_id, f"Tunnel error (attempt {attempt}): {e}")
             if not livestream_active:
                 break
