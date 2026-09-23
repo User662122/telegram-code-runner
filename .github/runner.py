@@ -1598,8 +1598,8 @@ def run_tunnel_with_autorestart(chat_id, is_first=True):
                     # Verify
                     vr = subprocess.run(["cloudflared", "--version"], capture_output=True, text=True, timeout=5)
                     send_message(chat_id, f"Reinstall check: {(vr.stdout or vr.stderr or '').strip()[:300]}")
-            except Exception as re:
-                print(f"[cf] reinstall failed {re}", flush=True)
+            except Exception as _re:
+                print(f"[cf] reinstall failed {_re}", flush=True)
             time.sleep(10)
         except Exception as e:
             import traceback
