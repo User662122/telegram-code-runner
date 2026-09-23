@@ -1296,8 +1296,29 @@ def ui_automation(chat_id, action, params=None):
         send_message(chat_id, f"UI Error: {e}")
 
 # ---------- Livestream with interactive controls ----------
+def _find_cloudflared():
+    # Try common locations on Windows and Linux
+    for cand in ["cloudflared", "cloudflared.exe", r"C:\\Windows\\System32\\cloudflared.exe", "/usr/local/bin/cloudflared", "/usr/bin/cloudflared"]:
+        wh = shutil.which(cand) if not os.path.isabs(cand) else (cand if os.path.exists(cand) else None)
+        if wh:
+            return wh
+        if os.path.exists(cand):
+            return cand
+    return shutil.which("cloudflared") or "cloudflared"
+
+def _is_port_open(port=5000, host="127.0.0.1", timeout=1):
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((host, port))
+        s.close()
+        return True
+    except:
+        return False
+
 def run_tunnel_with_autorestart(chat_id, is_first=True):
-    """Start cloudflared tunnel and auto-restart when it dies. Runs forever."""
+    """Start cloudflared tunnel and auto-restart when it dies. Robust: waits for Flask, times out, shows logs."""
     global livestream_proc, livestream_url, livestream_active
     attempt = 0
     while livestream_active:
@@ -1305,44 +1326,255 @@ def run_tunnel_with_autorestart(chat_id, is_first=True):
         livestream_url = None
         if not is_first or attempt > 1:
             send_message(chat_id, f"Reconnecting tunnel (attempt {attempt})...")
+        # Wait for Flask to be ready
+        flask_ready = False
+        for i in range(15):
+            if not livestream_active:
+                return
+            if _is_port_open(5000):
+                flask_ready = True
+                break
+            time.sleep(1)
+        if not flask_ready:
+            print("[cf] Flask not ready after 15s, still trying...", flush=True)
+            send_message(chat_id, "Waiting for web server... Flask not responding on port 5000 yet. Retrying...")
+        # Find binary
+        cfd = _find_cloudflared()
+        # Check binary exists
+        exists = shutil.which(cfd) or os.path.exists(cfd) if os.path.isabs(cfd) else shutil.which(cfd)
+        if not exists and not os.path.exists(r"C:\\Windows\\System32\\cloudflared.exe"):
+            print(f"[cf] cloudflared not found: {cfd}", flush=True)
         try:
-            cf_cmd = ["cloudflared", "tunnel", "--url", "http://127.0.0.1:5000"]
+            # Try with --no-autoupdate first, fallback without
+            tried_cmds = [
+                [cfd, "tunnel", "--url", "http://127.0.0.1:5000", "--no-autoupdate"],
+                [cfd, "tunnel", "--url", "http://127.0.0.1:5000"],
+                [cfd, "tunnel", "--url", "http://localhost:5000"],
+            ]
+            cf_cmd = tried_cmds[0]
             env = os.environ.copy()
             env["TUNNEL_ORIGIN_CERT"] = ""
-            livestream_proc = subprocess.Popen(
-                cf_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1, env=env
-            )
-            url_sent = False
-            for line in iter(livestream_proc.stdout.readline, ''):
-                if not line or not livestream_active:
+            # Try to start, if FileNotFound try next
+            started = False
+            last_err = None
+            for cmd in tried_cmds:
+                try:
+                    print(f"[cf] Trying: {' '.join(cmd)}", flush=True)
+                    livestream_proc = subprocess.Popen(
+                        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        text=True, bufsize=1, env=env
+                    )
+                    started = True
+                    cf_cmd = cmd
                     break
-                print(f"[cf] {line.strip()}", flush=True)
-                if not url_sent:
-                    match = re.search(r'https://[a-zA-Z0-9-]+\\.trycloudflare\\.com', line)
-                    if match:
-                        livestream_url = match.group(0)
-                        url_sent = True
-                        send_message(chat_id, f"Live Remote Desktop online: {livestream_url}\nOpen on phone/PC for full control (tap to click, type, keyboard)")
-            ret = livestream_proc.wait()
+                except FileNotFoundError as e:
+                    last_err = e
+                    continue
+            if not started:
+                raise FileNotFoundError(f"cloudflared not found ({cfd}): {last_err}. Reinstalling...")
+            # Wait for URL with timeout 45s using single reader thread
+            url_sent = False
+            logs = []
+            start = time.time()
+            q = None
+            reader_alive = True
+            try:
+                import queue
+                q = queue.Queue()
+                def _reader():
+                    try:
+                        for ln in iter(livestream_proc.stdout.readline, ''):
+                            if not livestream_active:
+                                break
+                            if ln is None:
+                                break
+                            q.put(ln)
+                            if livestream_proc.poll() is not None and not ln:
+                                break
+                    except Exception as e:
+                        print(f"[cf-reader] {e}", flush=True)
+                        q.put(None)
+                    finally:
+                        q.put(None)
+                rt = threading.Thread(target=_reader, daemon=True)
+                rt.start()
+                # Wait up to 45s for URL
+                while livestream_active and time.time() - start < 45:
+                    if livestream_proc.poll() is not None:
+                        # process died early, drain queue quickly
+                        try:
+                            while not q.empty():
+                                ln = q.get_nowait()
+                                if ln and ln.strip():
+                                    logs.append(ln.strip())
+                                    print(f"[cf] {ln.strip()}", flush=True)
+                        except:
+                            pass
+                        break
+                    try:
+                        line = q.get(timeout=1)
+                    except queue.Empty:
+                        continue
+                    if line is None:
+                        # EOF
+                        if livestream_proc.poll() is not None:
+                            break
+                        continue
+                    line = line.strip()
+                    if not line:
+                        continue
+                    # Strip ANSI codes for URL detection
+                    clean_line = re.sub(r'\x1b\[[^m]*m', '', line)
+                    logs.append(clean_line)
+                    if len(logs) > 80:
+                        logs = logs[-80:]
+                    print(f"[cf] {clean_line}", flush=True)
+                    if not url_sent:
+                        m = re.search(r'https://[a-zA-Z0-9\-]+\.trycloudflare\.com[^\s\x1b]*', clean_line)
+                        if m:
+                            # strip ANSI remnants and punctuation
+                            raw = m.group(0)
+                            raw = re.sub(r'\x1b\[[^m]*m', '', raw)
+                            livestream_url = raw.rstrip('.,)"\']')
+                            url_sent = True
+                            send_message(chat_id, f"Live Remote Desktop online: {livestream_url}\nOpen on phone/PC for full control (tap to click, type, keyboard)\nIf page shows 502, wait 5s and refresh. Use `livestream status` or `livestream restart` if stuck.")
+                        elif "trycloudflare.com" in clean_line and "https://" in clean_line:
+                            mm = re.search(r'https://[^\s]+trycloudflare\.com[^\s]*', clean_line)
+                            if mm:
+                                raw = re.sub(r'\x1b\[[^m]*m', '', mm.group(0))
+                                livestream_url = raw.rstrip('.,)"\']')
+                                url_sent = True
+                                send_message(chat_id, f"Live Remote Desktop online: {livestream_url}\nOpen on phone/PC for full control")
+                    # Also detect common fatal errors early
+                    if not url_sent and ("failed" in clean_line.lower() and "quic" not in clean_line.lower()):
+                        # keep logging but not break; wait a bit more
+                        pass
+            except Exception as e:
+                print(f"[cf] wait error {e}", flush=True)
+            if not url_sent:
+                # Timeout: send diagnostics
+                err_logs = "\n".join(logs[-25:]) if logs else "(no output)"
+                # Check if process is still alive
+                alive = livestream_proc.poll() is None
+                ret = livestream_proc.poll()
+                diag = f"Tunnel failed to get URL after 45s (attempt {attempt}). Alive={alive} exit={ret}\nLast logs:\n{TICK}\n{err_logs}\n{TICK}\n"
+                # Check common reasons
+                if any("failed" in l.lower() or "error" in l.lower() for l in logs):
+                    diag += "\nCheck firewall / network. Retrying in 5s..."
+                else:
+                    diag += "\nRetrying in 5s... If repeated, run `livestream restart` or `sysinfo` to check VM."
+                send_message(chat_id, diag)
+                try:
+                    livestream_proc.terminate()
+                except:
+                    pass
+                try:
+                    livestream_proc.wait(timeout=3)
+                except:
+                    try:
+                        livestream_proc.kill()
+                    except:
+                        pass
+                if not livestream_active:
+                    break
+                time.sleep(5)
+                continue
+            # URL obtained, now monitor tunnel until it dies via queue
+            print(f"[cf] Tunnel online at {livestream_url}, monitoring...", flush=True)
+            # Continue draining via same queue, monitor for exit
+            while livestream_active and livestream_proc.poll() is None:
+                try:
+                    line = q.get(timeout=2)
+                    if line is None:
+                        if livestream_proc.poll() is not None:
+                            break
+                        continue
+                    line = line.strip()
+                    if line:
+                        print(f"[cf] {line}", flush=True)
+                except:
+                    # timeout, check still alive
+                    continue
+            # Drain any remaining logs
+            try:
+                while not q.empty():
+                    ln = q.get_nowait()
+                    if ln and ln.strip():
+                        print(f"[cf] {ln.strip()}", flush=True)
+            except:
+                pass
+            ret = livestream_proc.poll()
             print(f"[cf] Tunnel exited (code {ret})", flush=True)
             if not livestream_active:
                 break
-            send_message(chat_id, "Tunnel disconnected, restarting in 5s...")
+            send_message(chat_id, f"Tunnel disconnected (code {ret}), restarting in 5s... If frequent, try `livestream status`.")
             time.sleep(5)
+        except FileNotFoundError as e:
+            print(f"[cf] FileNotFound: {e}", flush=True)
+            send_message(chat_id, f"cloudflared binary not found: {e}\nAttempting reinstall. If persists, check workflow Install Cloudflared step. Retrying in 10s...")
+            # Try to reinstall quickly on Windows
+            try:
+                if os.name == 'nt':
+                    subprocess.run("curl -L --output cloudflared.exe https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe", shell=True, timeout=30)
+                    subprocess.run("move /Y cloudflared.exe C:\\Windows\\System32\\", shell=True, timeout=10)
+            except Exception as re:
+                print(f"[cf] reinstall failed {re}", flush=True)
+            time.sleep(10)
         except Exception as e:
             print(f"[cf] Error: {e}", flush=True)
+            send_message(chat_id, f"Tunnel error (attempt {attempt}): {e}")
             if not livestream_active:
                 break
             time.sleep(5)
 
+def livestream_status(chat_id):
+    if not livestream_active:
+        send_message(chat_id, "Livestream not running. Send `livestream` to start.")
+        return True
+    port_ok = _is_port_open(5000)
+    proc_ok = livestream_proc is not None and livestream_proc.poll() is None
+    send_message(chat_id, f"Livestream status:\n- Active: {livestream_active}\n- Flask: {livestream_flask_started} (port 5000 open={port_ok})\n- Tunnel proc alive={proc_ok} pid={getattr(livestream_proc,'pid','?')}\n- URL: {livestream_url or '(connecting - wait 30s or try livestream restart)'}\n- Screen: {SCREEN_W}x{SCREEN_H}\nIf stuck on connecting >45s, do `livestream restart` then `livestream status`.")
+    return True
+
+def livestream_restart(chat_id):
+    global livestream_proc, livestream_url, livestream_active, livestream_flask_started
+    send_message(chat_id, "Restarting livestream...")
+    livestream_active = False
+    if livestream_proc:
+        try: livestream_proc.terminate()
+        except: pass
+        try: livestream_proc.wait(timeout=3)
+        except:
+            try: livestream_proc.kill()
+            except: pass
+    livestream_proc = None
+    livestream_url = None
+    # Keep Flask alive if it was started, otherwise restart fully
+    # Give a moment then restart tunnel if Flask still alive, else full restart
+    time.sleep(1)
+    if livestream_flask_started and _is_port_open(5000):
+        livestream_active = True
+        threading.Thread(target=run_tunnel_with_autorestart, args=(chat_id, True), daemon=True).start()
+        send_message(chat_id, "Flask still running, restarted tunnel.. wait 20s for new link.")
+    else:
+        livestream_active = False
+        livestream_flask_started = False
+        livestream(chat_id)
+    return True
+
 def livestream(chat_id):
     global livestream_proc, livestream_url, livestream_active, livestream_flask_started, SCREEN_W, SCREEN_H
     if livestream_active and livestream_flask_started:
-        send_message(chat_id, f"Live Remote Desktop already running: {livestream_url or '(connecting...)'}")
+        if livestream_url:
+            send_message(chat_id, f"Live Remote Desktop already running: {livestream_url}\nSend `livestream restart` to refresh or `livestream status` for diagnostics.")
+        else:
+            # Check if tunnel thread is stuck
+            port_ok = _is_port_open(5000)
+            proc_alive = livestream_proc is not None and livestream_proc.poll() is None
+            send_message(chat_id, f"Live Remote Desktop starting... (connecting...)\nFlask port 5000 open={port_ok} tunnel alive={proc_alive}\nWait 30s; if no link, `livestream status` or `livestream restart`.")
         return
     if livestream_active:
-        send_message(chat_id, "LiveStream starting, please wait...")
+        send_message(chat_id, "LiveStream starting, please wait... ( Flask booting )")
         return
 
     def run_server():
@@ -1805,6 +2037,8 @@ WELCOME = (
     "*📸 Screen & Remote:*\n"
     "- `screen` - Screenshot\n"
     "- `livestream` / `live` - Interactive Remote Desktop (tap/click, type, keys via browser)\n"
+    "- `livestream status` - Check tunnel URL & diagnostics\n"
+    "- `livestream restart` - Restart tunnel if stuck on connecting...\n"
     "- `stop stream` - Stop livestream\n\n"
     "*⌨️ Write / Keyboard / Mouse (NEW - Full Control):*\n"
     "- `type <text>` - Type text into active window (fast via clipboard if needed)\n"
@@ -1898,6 +2132,12 @@ while True:
                 sys.exit(0)
             if text in ("screen", "screenshot", "ss", "capture", "screen hd", "screen low", "screencap"):
                 take_screenshot(chat_id, mode=text)
+                continue
+            if text in ("livestream status", "live status", "stream status", "livestream url", "live url", "tunnel status", "tunnel url"):
+                livestream_status(chat_id)
+                continue
+            if text in ("livestream restart", "live restart", "stream restart", "restart stream", "restart livestream", "tunnel restart") or text in ("livestream reconnect", "reconnect"):
+                livestream_restart(chat_id)
                 continue
             if text in ("livestream", "live", "stream", "remote", "desktop", "vs"):
                 livestream(chat_id)
